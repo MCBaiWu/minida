@@ -1,0 +1,2 @@
+# minida
+这是我用imgui写的安卓端的so逆向工具，参考了ida的布局实现，使用capstone与keystone来实现so解析显示汇编指令与控制流流程图cfg
