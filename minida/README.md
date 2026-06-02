@@ -17,7 +17,7 @@ Android 上的轻量级 SO 逆向工具，使用 ImGui 构建 UI，参考 IDA �
 |:---:|:---:|
 | ![Assembly](assets/screenshots/01-assembly-view.jpg) | ![CFG](assets/screenshots/02-cfg-view.jpg) |
 
-| 导出表 | Hex 视图 |
+| Hex 视图 | 导出表 |
 |:---:|:---:|
 | ![Exports](assets/screenshots/03-export-table.jpg) | ![Hex](assets/screenshots/05-hex-view.jpg) |
 
