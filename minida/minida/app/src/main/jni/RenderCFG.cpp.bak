@@ -1,0 +1,1577 @@
+// ============================================================================
+// CFG 绘制 v20.0 修复版：A* 占用感知 + 双向端口偏移 + 管道走廊扩容
+// ============================================================================
+
+#include "Common.h"
+#include <cmath>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <algorithm>
+#include <string>
+#include <functional>
+#include <map>
+#include <set>
+#include <memory>
+#include <stack>
+#include <limits>
+#include <tuple>
+
+// ============================================================================
+// 常量
+// ============================================================================
+static const int   GRID_SIZE            = 20;
+static const float NODE_MIN_WIDTH       = 200.0f;
+static const float NODE_MIN_HEIGHT      = 90.0f;
+static const float NODE_MAX_WIDTH       = 400.0f;
+static const float NODE_MAX_HEIGHT      = 600.0f;
+static const int   H_SPACING            = 140;
+static const int   V_SPACING            = 160;
+static const float ARROW_SIZE           = 14.0f;
+static const float STROKE_WIDTH         = 3.0f;
+static const float HIGHLIGHT_WIDTH      = 5.0f;
+static const int   LANE_SPACING         = 8;
+static const float NODE_MARGIN          = 16.0f;
+static const int   MAX_OFFSET_ITER      = 60;
+static const float VERT_OFFSET          = 30.0f;
+static const float MIN_VERTICAL_DEPARTURE = 40.0f;
+
+// ============================================================================
+// 网格工具
+// ============================================================================
+static inline int   ToGrid(float world)     { return (int)std::round(world / GRID_SIZE); }
+static inline float ToWorld(int grid)       { return grid * GRID_SIZE; }
+static inline float SnapToGrid(float world) { return ToWorld(ToGrid(world)); }
+static inline float ClampFloat(float v, float lo, float hi) { return v<<lo?lo:(v>hi?hi:v); }
+
+// ============================================================================
+// 拖动状态
+// ============================================================================
+struct CFGDragState {
+    ImVec2 startMouse, startScroll;
+    bool active;
+    CFGDragState() : active(false) {}
+};
+
+// ============================================================================
+// 节点
+// ============================================================================
+struct CFGNodeEx {
+    uint64_t startAddr, endAddr;
+    std::string disassembly;
+    bool isEntry, isExit;
+    ImVec2 size;
+    float x, y;
+    int layer, pos_in_layer;
+    bool is_dummy, is_reversed;
+    ImU32 bgColor, borderColor;
+
+    ImVec2 GetTopPort()    const { return ImVec2(x + size.x * 0.5f, y); }
+    ImVec2 GetBottomPort() const { return ImVec2(x + size.x * 0.5f, y + size.y); }
+    ImVec2 GetLeftPort()   const { return ImVec2(x, y + size.y * 0.5f); }
+    ImVec2 GetRightPort()  const { return ImVec2(x + size.x, y + size.y * 0.5f); }
+
+    float BlockLeft()   const { return x - NODE_MARGIN; }
+    float BlockRight()  const { return x + size.x + NODE_MARGIN; }
+    float BlockTop()    const { return y - NODE_MARGIN; }
+    float BlockBottom() const { return y + size.y + NODE_MARGIN; }
+    bool Contains(float px, float py) const {
+        return px >= BlockLeft() && px <= BlockRight() && py >= BlockTop() && py <= BlockBottom();
+    }
+
+    CFGNodeEx() : x(0),y(0),layer(-1),pos_in_layer(-1),
+                  is_dummy(false),is_reversed(false),
+                  bgColor(IM_COL32(42,52,42,255)),
+                  borderColor(IM_COL32(90,130,90,255)) {}
+};
+
+// ============================================================================
+// 边（修复：增加 inPortIndex 用于目标节点顶部端口偏移）
+// ============================================================================
+struct CFGEdgeEx {
+    int from, to;
+    CFGEdgeType type;
+    bool is_reversed;
+    std::vector<<ImVec2> path;
+    int priority;
+    int portIndex;      // 源节点底部端口序号
+    int inPortIndex;    // 目标节点顶部端口序号（新增）
+
+    CFGEdgeEx() : from(-1),to(-1),type(CFGEdgeType::Normal),
+                  is_reversed(false),priority(0),portIndex(0),inPortIndex(0) {}
+};
+
+// ============================================================================
+// 层结构
+// ============================================================================
+struct CFGLayer {
+    std::vector<int> nodes;
+    float height, width, position, gap;
+};
+
+// ============================================================================
+// 占用段类型（修复：容差对齐网格）
+// ============================================================================
+enum class SegType { HORIZONTAL, VERTICAL };
+
+struct EdgeSegment {
+    SegType type;
+    float fixedCoord;
+    float minCoord, maxCoord;
+    int laneIdx;
+};
+
+class OccupancyMap {
+public:
+    std::vector<<EdgeSegment> segments;
+
+    // 修复：容差从 1.0f 提升到 8.0f，与 20px 网格匹配
+    bool IsSegmentOverlapping(const EdgeSegment& seg, float tolerance = 8.0f) const {
+        for (const auto& e : segments) {
+            if (e.type != seg.type) continue;
+            if (std::fabs(e.fixedCoord - seg.fixedCoord) < tolerance) {
+                float overlapMin = std::max(e.minCoord, seg.minCoord);
+                float overlapMax = std::min(e.maxCoord, seg.maxCoord);
+                if (overlapMax - overlapMin > tolerance) return true;
+            }
+        }
+        return false;
+    }
+
+    void AddSegment(const EdgeSegment& seg) { segments.push_back(seg); }
+    void Clear() { segments.clear(); }
+};
+
+// ============================================================================
+// 管道数据结构
+// ============================================================================
+struct PipeLane {
+    float coord;
+    SegType type;
+    float laneSpacing;
+    std::vector<bool> occupied;
+    int nextLane;
+    float minRange, maxRange;
+    bool isValid;
+
+    PipeLane() : coord(0), type(SegType::HORIZONTAL), laneSpacing(LANE_SPACING),
+                 nextLane(0), minRange(0), maxRange(0), isValid(false) {}
+
+    float GetLaneCoord(int laneIdx) const {
+        if (!isValid || occupied.empty()) return coord;
+        float offset = (laneIdx - ((int)occupied.size() - 1) * 0.5f) * laneSpacing;
+        return coord + offset;
+    }
+
+    int AllocLane() {
+        if (!isValid) return 0;
+        for (int i = 0; i < (int)occupied.size(); ++i) {
+            int idx = (nextLane + i) % (int)occupied.size();
+            if (!occupied[idx]) {
+                occupied[idx] = true;
+                nextLane = (idx + 1) % (int)occupied.size();
+                return idx;
+            }
+        }
+        int newIdx = (int)occupied.size();
+        occupied.push_back(true);
+        return newIdx;
+    }
+
+    void FreeLane(int idx) {
+        if (idx >= 0 && idx < (int)occupied.size()) occupied[idx] = false;
+    }
+
+    bool IsEmpty() const { return !isValid || occupied.empty(); }
+    int Capacity() const { return (int)occupied.size(); }
+    int UsedCount() const {
+        int c = 0;
+        for (bool b : occupied) if (b) c++;
+        return c;
+    }
+};
+
+// ============================================================================
+// 布局主结构
+// ============================================================================
+struct GraphLayout {
+    std::vector<<CFGNodeEx> nodes;
+    std::vector<<CFGEdgeEx> edges;
+    std::vector<<CFGLayer> layers;
+    int n_layers;
+    float max_x, max_y;
+    std::vector<std::vector<int>> succs, preds;
+    OccupancyMap occupancy;
+
+    std::vector<<PipeLane> hPipes;
+    std::vector<<PipeLane> vPipes;
+    PipeLane rightTrunk;
+    PipeLane bottomPipe;
+    PipeLane topPipe;
+    bool showPipes = false;
+
+    void Clear() {
+        nodes.clear(); edges.clear(); layers.clear();
+        n_layers=0; max_x=max_y=0; succs.clear(); preds.clear();
+        occupancy.Clear();
+        hPipes.clear(); vPipes.clear();
+        rightTrunk = PipeLane();
+        bottomPipe = PipeLane();
+        topPipe = PipeLane();
+        showPipes = false;
+    }
+};
+
+// ============================================================================
+// 全局状态
+// ============================================================================
+static std::unordered_map<uint64_t, GraphLayout> g_layouts;
+static std::unordered_map<uint64_t, uint64_t> g_selectedNodeByFunc;
+static std::unordered_map<uint64_t, CFGDragState> g_dragStates;
+static std::unordered_map<uint64_t, float> s_lastZoom;
+
+// ============================================================================
+// 工具函数
+// ============================================================================
+static std::vector<<ImVec2> EnforceOrthogonal(const std::vector<<ImVec2>& pts) {
+    if (pts.size() < 2) return pts;
+    std::vector<<ImVec2> res;
+    res.push_back(pts[0]);
+    for (size_t i = 1; i < pts.size(); ++i) {
+        const auto& prev = res.back();
+        const auto& curr = pts[i];
+        if (std::fabs(prev.x - curr.x) > 1.0f && std::fabs(prev.y - curr.y) > 1.0f)
+            res.push_back(ImVec2(prev.x, curr.y));
+        res.push_back(curr);
+    }
+    return res;
+}
+
+static std::vector<<ImVec2> SimplifyPath(const std::vector<<ImVec2>& pts) {
+    if (pts.size() < 3) return pts;
+    std::vector<<ImVec2> out;
+    out.push_back(pts[0]);
+    for (size_t i = 1; i < pts.size()-1; ++i) {
+        const auto& a = out.back(), & b = pts[i], & c = pts[i+1];
+        bool col = (std::fabs(a.x-b.x)<1.0f && std::fabs(b.x-c.x)<1.0f) ||
+                   (std::fabs(a.y-b.y)<1.0f && std::fabs(b.y-c.y)<1.0f);
+        if (!col) out.push_back(b);
+    }
+    out.push_back(pts.back());
+    return out;
+}
+
+// 绝对清洗斜线，插入拐点
+static std::vector<<ImVec2> CleanPath(const std::vector<<ImVec2>& pts) {
+    auto path = EnforceOrthogonal(pts);
+    path = SimplifyPath(path);
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (std::fabs(path[i].x - path[i-1].x) > 1.0f && std::fabs(path[i].y - path[i-1].y) > 1.0f) {
+            path.insert(path.begin() + i, ImVec2(path[i-1].x, path[i].y));
+            ++i;
+        }
+    }
+    return SimplifyPath(path);
+}
+
+static ImVec2 WorldToScreen(ImVec2 p, const ImVec2& canvasPos, const ImVec2& scroll, float zoom) {
+    return ImVec2(canvasPos.x + (p.x + scroll.x) * zoom, canvasPos.y + (p.y + scroll.y) * zoom);
+}
+static ImVec2 ScreenToWorld(ImVec2 p, const ImVec2& canvasPos, const ImVec2& scroll, float zoom) {
+    return ImVec2((p.x - canvasPos.x) / zoom - scroll.x, (p.y - canvasPos.y) / zoom - scroll.y);
+}
+static std::string FormatOffsetStr(uint64_t addr, uint64_t baseAddr) {
+    int64_t o = (int64_t)addr - (int64_t)baseAddr;
+    char buf[32];
+    if(o>=0) snprintf(buf,sizeof(buf),"+0x%llX",(unsigned long long)o);
+    else snprintf(buf,sizeof(buf),"-0x%llX",(unsigned long long)(-o));
+    return buf;
+}
+static bool IsReturnInstruction(const std::string& m) {
+    if(m.empty()) return false;
+    static const char* rets[]={"ret","bx lr","pop","ldm","mov pc","b ","bxeq","bxne",
+        "popeq","popne","ldmia","ldmfd","moveq","movne","beq","bne","bgt","blt","bge","ble"};
+    std::string l=m; std::transform(l.begin(),l.end(),l.begin(),::tolower);
+    for(auto* r:rets) if(l.find(r)==0) return true;
+    return false;
+}
+
+// ============================================================================
+// CFGGraph::Clear()
+// ============================================================================
+void CFGGraph::Clear() {
+    nodes.clear(); edges.clear(); valid=false;
+    funcName.clear(); funcAddress=0;
+}
+
+// ============================================================================
+// 阶段1：布局
+// ============================================================================
+static void AssignLayersTopo(GraphLayout& g) {
+    int n=(int)g.nodes.size(); if(n==0) return;
+    std::vector<int> inDeg(n,0);
+    for(int i=0;i<n;i++) inDeg[i]=(int)g.preds[i].size();
+    std::queue<int> q;
+    for(int i=0;i<n;i++) if(inDeg[i]==0) q.push(i);
+    std::vector<int> order;
+    while(!q.empty()){
+        int u=q.front(); q.pop(); order.push_back(u);
+        for(int v:g.succs[u]){ inDeg[v]--; if(inDeg[v]==0) q.push(v); }
+    }
+    for(auto& nd:g.nodes) nd.layer=0;
+    for(int u:order) for(int v:g.succs[u]) if(g.nodes[v].layer < g.nodes[u].layer+1) g.nodes[v].layer=g.nodes[u].layer+1;
+}
+
+static void CreateLayers(GraphLayout& g) {
+    int n=(int)g.nodes.size(); if(n==0) return;
+    g.n_layers=0;
+    for(auto& nd:g.nodes) if(nd.layer>g.n_layers) g.n_layers=nd.layer;
+    g.n_layers++; g.layers.resize(g.n_layers);
+    for(int i=0;i<n;i++){ int l=g.nodes[i].layer; if(l>=0&&l<<g.n_layers) g.layers[l].nodes.push_back(i); }
+}
+
+static void AssignCoordinates(GraphLayout& g) {
+    int n=(int)g.nodes.size(); if(n==0) return;
+    for(auto& nd:g.nodes){
+        nd.size.x = SnapToGrid(ClampFloat(nd.size.x, NODE_MIN_WIDTH, NODE_MAX_WIDTH));
+        nd.size.y = SnapToGrid(ClampFloat(nd.size.y, NODE_MIN_HEIGHT, NODE_MAX_HEIGHT));
+    }
+    std::vector<float> layerMaxH(g.n_layers, 0.0f);
+    for(int l=0;l<<g.n_layers;l++)
+        for(int idx:g.layers[l].nodes)
+            layerMaxH[l] = std::max(layerMaxH[l], g.nodes[idx].size.y);
+    float curY = 100.0f;
+    for(int l=0;l<<g.n_layers;l++){
+        for(int idx:g.layers[l].nodes) g.nodes[idx].y = SnapToGrid(curY);
+        curY += layerMaxH[l] + V_SPACING;
+    }
+    for(int l=0;l<<g.n_layers;l++){
+        auto& vec = g.layers[l].nodes;
+        if(vec.empty()) continue;
+        float totalWidth = 0.0f;
+        for(int idx:vec) totalWidth += g.nodes[idx].size.x;
+        totalWidth += (vec.size()-1) * H_SPACING;
+        float startX = 400.0f - totalWidth * 0.5f;
+        startX = SnapToGrid(startX);
+        float cx = startX;
+        for(int idx:vec){
+            g.nodes[idx].x = cx;
+            cx += g.nodes[idx].size.x + H_SPACING;
+        }
+    }
+    for(auto& nd:g.nodes){ nd.x = SnapToGrid(nd.x); nd.y = SnapToGrid(nd.y); }
+    g.max_x = g.max_y = 0;
+    for(auto& nd:g.nodes){
+        g.max_x = std::max(g.max_x, nd.x + nd.size.x);
+        g.max_y = std::max(g.max_y, nd.y + nd.size.y);
+    }
+    g.max_x += 100; g.max_y += 100;
+}
+
+// ============================================================================
+// 阶段2：避障辅助函数
+// ============================================================================
+static bool IsPointBlocked(const GraphLayout& g, float x, float y, int exclFrom, int exclTo) {
+    for (int i = 0; i < (int)g.nodes.size(); ++i) {
+        if (i == exclFrom || i == exclTo || g.nodes[i].is_dummy) continue;
+        if (g.nodes[i].Contains(x, y)) return true;
+    }
+    return false;
+}
+
+static bool IsSegmentClear(const GraphLayout& g, ImVec2 a, ImVec2 b, int exclFrom, int exclTo) {
+    if (std::fabs(a.x - b.x) < 1.0f) {
+        float minY = std::min(a.y, b.y), maxY = std::max(a.y, b.y);
+        for (float y = minY; y <= maxY; y += GRID_SIZE)
+            if (IsPointBlocked(g, a.x, y, exclFrom, exclTo)) return false;
+        return true;
+    } else if (std::fabs(a.y - b.y) < 1.0f) {
+        float minX = std::min(a.x, b.x), maxX = std::max(a.x, b.x);
+        for (float x = minX; x <= maxX; x += GRID_SIZE)
+            if (IsPointBlocked(g, x, a.y, exclFrom, exclTo)) return false;
+        return true;
+    }
+    return false;
+}
+
+static bool IsPathBlocked(const GraphLayout& g, const std::vector<<ImVec2>& pts, int exclFrom, int exclTo) {
+    for (size_t i = 1; i < pts.size(); ++i)
+        if (!IsSegmentClear(g, pts[i-1], pts[i], exclFrom, exclTo))
+            return true;
+    return false;
+}
+
+static bool TryOffsetSegment(const GraphLayout& g, ImVec2& a, ImVec2& b,
+                             int exclFrom, int exclTo, int maxAttempts = 30) {
+    if (IsSegmentClear(g, a, b, exclFrom, exclTo)) return true;
+
+    if (std::fabs(a.x - b.x) < 1.0f) {
+        float baseX = a.x;
+        for (int i = 1; i <= maxAttempts; ++i) {
+            for (int sign : {-1, 1}) {
+                float newX = SnapToGrid(baseX + sign * i * LANE_SPACING);
+                if (!IsPointBlocked(g, newX, a.y, exclFrom, exclTo) &&
+                    !IsPointBlocked(g, newX, b.y, exclFrom, exclTo) &&
+                    IsSegmentClear(g, ImVec2(newX, a.y), ImVec2(newX, b.y), exclFrom, exclTo)) {
+                    a.x = newX; b.x = newX;
+                    return true;
+                }
+            }
+        }
+    } else {
+        float baseY = a.y;
+        for (int i = 1; i <= maxAttempts; ++i) {
+            for (int sign : {-1, 1}) {
+                float newY = SnapToGrid(baseY + sign * i * LANE_SPACING);
+                if (!IsPointBlocked(g, a.x, newY, exclFrom, exclTo) &&
+                    !IsPointBlocked(g, b.x, newY, exclFrom, exclTo) &&
+                    IsSegmentClear(g, ImVec2(a.x, newY), ImVec2(b.x, newY), exclFrom, exclTo)) {
+                    a.y = newY; b.y = newY;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static std::vector<<ImVec2> AdjustPathAwayFromNodes(GraphLayout& g, const std::vector<<ImVec2>& original,
+                                                   int exclFrom, int exclTo) {
+    if (original.size() < 2) return original;
+    std::vector<<ImVec2> path = original;
+    bool changed = true;
+    int globalIter = 0;
+    while (changed && globalIter < 10) {
+        changed = false;
+        globalIter++;
+        for (size_t i = 1; i < path.size(); ++i) {
+            ImVec2 a = path[i-1], b = path[i];
+            if (!IsSegmentClear(g, a, b, exclFrom, exclTo)) {
+                if (TryOffsetSegment(g, a, b, exclFrom, exclTo)) {
+                    path[i-1] = a;
+                    path[i] = b;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if (IsPathBlocked(g, path, exclFrom, exclTo)) return {};
+    return path;
+}
+
+static std::vector<<ImVec2> CreateSafeExternalPath(const GraphLayout& g, int fromIdx, int toIdx,
+                                                  const ImVec2& start, const ImVec2& end) {
+    float safeY = 0.0f;
+    for (const auto& nd : g.nodes) {
+        if (nd.is_dummy) continue;
+        safeY = std::max(safeY, nd.BlockBottom());
+    }
+    safeY = SnapToGrid(safeY + 60.0f);
+    std::vector<<ImVec2> path;
+    path.push_back(start);
+    float departY = std::max(safeY, start.y + MIN_VERTICAL_DEPARTURE);
+    path.push_back(ImVec2(start.x, departY));
+    path.push_back(ImVec2(end.x, departY));
+    path.push_back(ImVec2(end.x, end.y - VERT_OFFSET));
+    path.push_back(end);
+    return CleanPath(path);
+}
+
+// 强化版占用冲突解决：逐段偏移，整体平移
+static std::vector<<ImVec2> ResolveOverlapWithOccupancy(GraphLayout& g,
+                                                       const std::vector<<ImVec2>& candidate,
+                                                       int exclFrom, int exclTo) {
+    auto path = candidate;
+    const int MAX_GLOBAL_ITER = 20;
+    for (int global = 0; global < MAX_GLOBAL_ITER; ++global) {
+        bool conflict = false;
+        for (size_t i = 1; i < path.size(); ++i) {
+            const auto& a = path[i-1], & b = path[i];
+            EdgeSegment seg;
+            if (std::fabs(a.x - b.x) < 1.0f) {
+                seg.type = SegType::VERTICAL; seg.fixedCoord = a.x;
+                seg.minCoord = std::min(a.y, b.y); seg.maxCoord = std::max(a.y, b.y);
+            } else {
+                seg.type = SegType::HORIZONTAL; seg.fixedCoord = a.y;
+                seg.minCoord = std::min(a.x, b.x); seg.maxCoord = std::max(a.x, b.x);
+            }
+            if (g.occupancy.IsSegmentOverlapping(seg)) {
+                conflict = true;
+                bool fixed = false;
+                if (seg.type == SegType::HORIZONTAL) {
+                    for (int sign : {-1, 1}) {
+                        for (int offset = 1; offset <= 10; ++offset) {
+                            float newY = SnapToGrid(seg.fixedCoord + sign * LANE_SPACING * offset);
+                            if (!IsPointBlocked(g, a.x, newY, exclFrom, exclTo) &&
+                                !IsPointBlocked(g, b.x, newY, exclFrom, exclTo) &&
+                                !g.occupancy.IsSegmentOverlapping({SegType::HORIZONTAL, newY, seg.minCoord, seg.maxCoord})) {
+                                path[i-1].y = newY; path[i].y = newY;
+                                fixed = true;
+                                break;
+                            }
+                        }
+                        if (fixed) break;
+                    }
+                } else {
+                    for (int sign : {-1, 1}) {
+                        for (int offset = 1; offset <= 10; ++offset) {
+                            float newX = SnapToGrid(seg.fixedCoord + sign * LANE_SPACING * offset);
+                            if (!IsPointBlocked(g, newX, a.y, exclFrom, exclTo) &&
+                                !IsPointBlocked(g, newX, b.y, exclFrom, exclTo) &&
+                                !g.occupancy.IsSegmentOverlapping({SegType::VERTICAL, newX, seg.minCoord, seg.maxCoord})) {
+                                path[i-1].x = newX; path[i].x = newX;
+                                fixed = true;
+                                break;
+                            }
+                        }
+                        if (fixed) break;
+                    }
+                }
+                if (!fixed) {
+                    float bestOffset = 0;
+                    bool found = false;
+                    for (int sign : {-1, 1}) {
+                        for (int offset = 1; offset <= 15; ++offset) {
+                            float shift = sign * LANE_SPACING * offset;
+                            std::vector<<ImVec2> shifted = path;
+                            for (auto& p : shifted) {
+                                if (seg.type == SegType::HORIZONTAL) p.y += shift;
+                                else p.x += shift;
+                            }
+                            bool clear = true;
+                            for (size_t j = 1; j < shifted.size(); ++j) {
+                                EdgeSegment s;
+                                auto& pa = shifted[j-1], & pb = shifted[j];
+                                if (std::fabs(pa.x - pb.x) < 1.0f) {
+                                    s.type = SegType::VERTICAL; s.fixedCoord = pa.x;
+                                    s.minCoord = std::min(pa.y, pb.y); s.maxCoord = std::max(pa.y, pb.y);
+                                } else {
+                                    s.type = SegType::HORIZONTAL; s.fixedCoord = pa.y;
+                                    s.minCoord = std::min(pa.x, pb.x); s.maxCoord = std::max(pa.x, pb.x);
+                                }
+                                if (g.occupancy.IsSegmentOverlapping(s) ||
+                                    !IsSegmentClear(g, pa, pb, exclFrom, exclTo)) {
+                                    clear = false; break;
+                                }
+                            }
+                            if (clear) {
+                                bestOffset = shift;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) break;
+                    }
+                    if (found) {
+                        for (auto& p : path) {
+                            if (seg.type == SegType::HORIZONTAL) p.y += bestOffset;
+                            else p.x += bestOffset;
+                        }
+                    } else {
+                        return CreateSafeExternalPath(g, exclFrom, exclTo, candidate.front(), candidate.back());
+                    }
+                }
+                break;
+            }
+        }
+        if (!conflict) break;
+    }
+    return CleanPath(path);
+}
+
+static float CalcPortOffset(int portIndex, int totalEdges, float nodeWidth) {
+    if (totalEdges <= 1) return 0.0f;
+    float maxOffset = nodeWidth * 0.35f;
+    if (maxOffset < 30.0f) maxOffset = 30.0f;
+    if (maxOffset > nodeWidth * 0.4f) maxOffset = nodeWidth * 0.4f;
+    float step = (2.0f * maxOffset) / (totalEdges + 1);
+    return -maxOffset + step * (portIndex + 1);
+}
+
+// ============================================================================
+// 管道系统构建（车道扩容）
+// ============================================================================
+static void BuildPipes(GraphLayout& g) {
+    g.hPipes.clear();
+    g.vPipes.clear();
+    g.bottomPipe = PipeLane();
+    g.topPipe = PipeLane();
+    g.rightTrunk = PipeLane();
+    if (g.n_layers == 0) return;
+
+    // ---------- 1. 水平管道 ----------
+    for (int l = 0; l < g.n_layers - 1; ++l) {
+        float upperBottom = -1e6f, lowerTop = 1e6f;
+        for (int idx : g.layers[l].nodes)
+            upperBottom = std::max(upperBottom, g.nodes[idx].y + g.nodes[idx].size.y);
+        for (int idx : g.layers[l+1].nodes)
+            lowerTop = std::min(lowerTop, g.nodes[idx].y);
+        if (upperBottom < 0 || lowerTop > 1e5) continue;
+
+        float pipeY = SnapToGrid((upperBottom + lowerTop) * 0.5f);
+
+        int outCount = 0;
+        for (int idx : g.layers[l].nodes) outCount += (int)g.succs[idx].size();
+
+        PipeLane pipe;
+        pipe.coord = pipeY;
+        pipe.type = SegType::HORIZONTAL;
+        pipe.laneSpacing = LANE_SPACING;
+        pipe.minRange = 1e6f; pipe.maxRange = -1e6f;
+        for (auto& nd : g.nodes) {
+            pipe.minRange = std::min(pipe.minRange, nd.x);
+            pipe.maxRange = std::max(pipe.maxRange, nd.x + nd.size.x);
+        }
+        pipe.minRange -= 150.0f;
+        pipe.maxRange += 150.0f;
+        pipe.occupied.resize(std::max(12, outCount + 5), false);
+        pipe.nextLane = 0;
+        pipe.isValid = true;
+        g.hPipes.push_back(pipe);
+    }
+
+    // ---------- 2. 底部回边管道 ----------
+    float globalBottom = 0.0f;
+    for (auto& nd : g.nodes) globalBottom = std::max(globalBottom, nd.y + nd.size.y);
+    float bottomY = SnapToGrid(globalBottom + V_SPACING * 0.4f);
+
+    int reversedCount = 0;
+    for (auto& e : g.edges) if (e.is_reversed) reversedCount++;
+
+    g.bottomPipe.coord = bottomY;
+    g.bottomPipe.type = SegType::HORIZONTAL;
+    g.bottomPipe.laneSpacing = LANE_SPACING;
+    g.bottomPipe.minRange = -200.0f;
+    g.bottomPipe.maxRange = g.max_x + 300.0f;
+    g.bottomPipe.occupied.resize(std::max(16, reversedCount * 2 + 5), false);
+    g.bottomPipe.nextLane = 0;
+    g.bottomPipe.isValid = true;
+
+    // ---------- 3. 顶部回边管道 ----------
+    bool needTopPipe = false;
+    for (auto& e : g.edges) {
+        if (e.is_reversed && g.nodes[e.to].layer == 0) { needTopPipe = true; break; }
+    }
+    if (needTopPipe && g.n_layers > 0) {
+        float topY = 1e6f;
+        for (int idx : g.layers[0].nodes) topY = std::min(topY, g.nodes[idx].y);
+        topY = SnapToGrid(topY - V_SPACING * 0.25f);
+
+        int revToTop = 0;
+        for (auto& e : g.edges) if (e.is_reversed && g.nodes[e.to].layer == 0) revToTop++;
+
+        g.topPipe.coord = topY;
+        g.topPipe.type = SegType::HORIZONTAL;
+        g.topPipe.laneSpacing = LANE_SPACING;
+        g.topPipe.minRange = -200.0f;
+        g.topPipe.maxRange = g.max_x + 300.0f;
+        g.topPipe.occupied.resize(std::max(12, revToTop + 5), false);
+        g.topPipe.nextLane = 0;
+        g.topPipe.isValid = true;
+    }
+
+    // ---------- 4. 垂直管道 ----------
+    std::vector<float> xBounds;
+    for (auto& nd : g.nodes) {
+        xBounds.push_back(nd.x);
+        xBounds.push_back(nd.x + nd.size.x);
+    }
+    std::sort(xBounds.begin(), xBounds.end());
+    xBounds.erase(std::unique(xBounds.begin(), xBounds.end(),
+        [](float a, float b){ return std::fabs(a - b) < 2.0f; }), xBounds.end());
+
+    for (size_t i = 0; i < xBounds.size() - 1; ++i) {
+        float gap = xBounds[i+1] - xBounds[i];
+        if (gap < 60.0f) continue;
+
+        float xMid = SnapToGrid((xBounds[i] + xBounds[i+1]) * 0.5f);
+
+        bool insideNode = false;
+        for (auto& nd : g.nodes) {
+            if (xMid >= nd.BlockLeft() && xMid <= nd.BlockRight()) {
+                insideNode = true; break;
+            }
+        }
+        if (insideNode) continue;
+
+        int crossCount = 0;
+        for (auto& e : g.edges) {
+            if (g.nodes[e.from].is_dummy || g.nodes[e.to].is_dummy) continue;
+            float sx = g.nodes[e.from].x + g.nodes[e.from].size.x * 0.5f;
+            float dx = g.nodes[e.to].x + g.nodes[e.to].size.x * 0.5f;
+            float minSxDx = std::min(sx, dx);
+            float maxSxDx = std::max(sx, dx);
+            if (xMid >= minSxDx - 100.0f && xMid <= maxSxDx + 100.0f) crossCount++;
+        }
+
+        PipeLane pipe;
+        pipe.coord = xMid;
+        pipe.type = SegType::VERTICAL;
+        pipe.laneSpacing = LANE_SPACING;
+        pipe.minRange = 0;
+        pipe.maxRange = g.max_y + 300.0f;
+        pipe.occupied.resize(std::max(8, crossCount / 2 + 4), false);
+        pipe.nextLane = 0;
+        pipe.isValid = true;
+        g.vPipes.push_back(pipe);
+    }
+
+    // ---------- 5. 右侧主干道 ----------
+    float rightX = 0.0f;
+    for (auto& nd : g.nodes) rightX = std::max(rightX, nd.x + nd.size.x);
+    rightX = SnapToGrid(rightX + 120.0f);
+
+    g.rightTrunk.coord = rightX;
+    g.rightTrunk.type = SegType::VERTICAL;
+    g.rightTrunk.laneSpacing = LANE_SPACING;
+    g.rightTrunk.minRange = 0;
+    g.rightTrunk.maxRange = g.max_y + 300.0f;
+    g.rightTrunk.occupied.resize(std::max(20, reversedCount * 2 + 5), false);
+    g.rightTrunk.nextLane = 0;
+    g.rightTrunk.isValid = true;
+}
+// ============================================================================
+// 修复：管道走廊检测 —— 按容量动态计算有效宽度，给 A* 足够空间
+// ============================================================================
+static bool IsInPipeCorridor(const GraphLayout& g, int gx, int gy) {
+    float wx = ToWorld(gx), wy = ToWorld(gy);
+
+    // 水平管道：使用容量*laneSpacing/2 作为半宽
+    for (const auto& hp : g.hPipes) {
+        if (!hp.isValid) continue;
+        float halfWidth = hp.Capacity() * hp.laneSpacing * 0.5f + GRID_SIZE;
+        if (std::fabs(wy - hp.coord) <= halfWidth &&
+            wx >= hp.minRange - GRID_SIZE && wx <= hp.maxRange + GRID_SIZE)
+            return true;
+    }
+    if (!g.bottomPipe.IsEmpty()) {
+        float halfWidth = g.bottomPipe.Capacity() * g.bottomPipe.laneSpacing * 0.5f + GRID_SIZE;
+        if (std::fabs(wy - g.bottomPipe.coord) <= halfWidth)
+            return true;
+    }
+    if (!g.topPipe.IsEmpty()) {
+        float halfWidth = g.topPipe.Capacity() * g.topPipe.laneSpacing * 0.5f + GRID_SIZE;
+        if (std::fabs(wy - g.topPipe.coord) <= halfWidth)
+            return true;
+    }
+    auto checkV = [&](const PipeLane& vp) {
+        if (!vp.isValid) return false;
+        float halfWidth = vp.Capacity() * vp.laneSpacing * 0.5f + GRID_SIZE;
+        return (std::fabs(wx - vp.coord) <= halfWidth &&
+                wy >= vp.minRange - GRID_SIZE && wy <= vp.maxRange + GRID_SIZE);
+    };
+    for (const auto& vp : g.vPipes) if (checkV(vp)) return true;
+    return checkV(g.rightTrunk);
+}
+
+// ============================================================================
+// 修复：新增 A* 占用感知 —— 检查网格段是否已被其他边占用
+// ============================================================================
+static bool IsGridSegmentOccupied(const GraphLayout& g, int gx1, int gy1, int gx2, int gy2,
+                                  int exclFrom, int exclTo, float tolerance = 8.0f) {
+    ImVec2 a(ToWorld(gx1), ToWorld(gy1));
+    ImVec2 b(ToWorld(gx2), ToWorld(gy2));
+
+    EdgeSegment seg;
+    if (std::fabs(a.x - b.x) < 1.0f) {
+        seg.type = SegType::VERTICAL; seg.fixedCoord = a.x;
+        seg.minCoord = std::min(a.y, b.y); seg.maxCoord = std::max(a.y, b.y);
+    } else if (std::fabs(a.y - b.y) < 1.0f) {
+        seg.type = SegType::HORIZONTAL; seg.fixedCoord = a.y;
+        seg.minCoord = std::min(a.x, b.x); seg.maxCoord = std::max(a.x, b.x);
+    } else {
+        return false; // 斜线段不检查
+    }
+
+    // 排除当前边自身的起终点区域（允许在端口附近重叠）
+    return g.occupancy.IsSegmentOverlapping(seg, tolerance);
+}
+
+static bool IsGridSegmentBlocked(const GraphLayout& g,
+                                 int gx1, int gy1, int gx2, int gy2,
+                                 int exclFrom, int exclTo) {
+    ImVec2 a(ToWorld(gx1), ToWorld(gy1));
+    ImVec2 b(ToWorld(gx2), ToWorld(gy2));
+    return !IsSegmentClear(g, a, b, exclFrom, exclTo);
+}
+
+static float Heuristic(int gx, int gy, int gxEnd, int gyEnd) {
+    return std::abs(gx - gxEnd) + std::abs(gy - gyEnd);
+}
+
+// ============================================================================
+// 修复：A* 加入占用惩罚 + 转向惩罚，margin 逐级扩大
+// ============================================================================
+static const float TURN_PENALTY = GRID_SIZE * 8.0f;
+static const float OCCUPANCY_PENALTY = GRID_SIZE * 12.0f; // 强惩罚，优先绕开
+
+static std::vector<<ImVec2> TryAStar(const GraphLayout& g,
+                                    ImVec2 startWorld, ImVec2 endWorld,
+                                    int exclFrom, int exclTo,
+                                    int margin) {
+    int sx = ToGrid(startWorld.x), sy = ToGrid(startWorld.y);
+    int ex = ToGrid(endWorld.x), ey = ToGrid(endWorld.y);
+    if (!IsInPipeCorridor(g, sx, sy) || !IsInPipeCorridor(g, ex, ey))
+        return {};
+
+    int minX = std::min(sx, ex) - margin, maxX = std::max(sx, ex) + margin;
+    int minY = std::min(sy, ey) - margin, maxY = std::max(sy, ey) + margin;
+
+    struct AStarNode {
+        int x, y, dir;
+        float g, f;
+        int parentKey;
+        bool closed;
+    };
+    std::unordered_map<int, AStarNode> nodes;
+    auto key = [](int x, int y) { return y * 10000 + x; };
+
+    int startKey = key(sx, sy);
+    nodes[startKey] = {sx, sy, -1, 0, Heuristic(sx, sy, ex, ey), -1, false};
+
+    using PQItem = std::pair<float, int>;
+    std::priority_queue<PQItem, std::vector<PQItem>, std::greater<<>> open;
+    open.push({nodes[startKey].f, startKey});
+
+    const int dx[4] = {1, -1, 0, 0};
+    const int dy[4] = {0, 0, 1, -1};
+
+    while (!open.empty()) {
+        int curKey = open.top().second;
+        open.pop();
+        auto it = nodes.find(curKey);
+        if (it == nodes.end()) continue;
+        AStarNode& cur = it->second;
+        if (cur.closed) continue;
+        if (cur.x == ex && cur.y == ey) {
+            std::vector<<ImVec2> path;
+            int k = curKey;
+            while (k != -1) {
+                auto& nd = nodes[k];
+                path.push_back(ImVec2(ToWorld(nd.x), ToWorld(nd.y)));
+                k = nd.parentKey;
+            }
+            std::reverse(path.begin(), path.end());
+            return path;
+        }
+        cur.closed = true;
+
+        for (int d = 0; d < 4; ++d) {
+            int nx = cur.x + dx[d];
+            int ny = cur.y + dy[d];
+            if (nx < minX || nx > maxX || ny < minY || ny > maxY) continue;
+            if (!IsInPipeCorridor(g, nx, ny)) continue;
+            if (IsGridSegmentBlocked(g, cur.x, cur.y, nx, ny, exclFrom, exclTo))
+                continue;
+
+            int nkey = key(nx, ny);
+            float stepCost = GRID_SIZE;
+
+            // 转向惩罚
+            if (cur.dir != -1 && cur.dir != d) stepCost += TURN_PENALTY;
+
+            // 修复：占用感知 —— 若该段已被其他边占用，施加高惩罚
+            if (IsGridSegmentOccupied(g, cur.x, cur.y, nx, ny, exclFrom, exclTo)) {
+                stepCost += OCCUPANCY_PENALTY;
+            }
+
+            float ng = cur.g + stepCost;
+            auto& nb = nodes[nkey];
+            if (nb.closed) continue;
+            if (nb.g == 0 || ng < nb.g) {
+                nb.x = nx; nb.y = ny;
+                nb.g = ng;
+                nb.f = ng + Heuristic(nx, ny, ex, ey);
+                nb.dir = d;
+                nb.parentKey = curKey;
+                nb.closed = false;
+                open.push({nb.f, nkey});
+            }
+        }
+    }
+    return {};
+}
+
+static std::vector<<ImVec2> PipeConstrainedAStar(
+    const GraphLayout& g,
+    ImVec2 startWorld, ImVec2 endWorld,
+    int exclFrom, int exclTo)
+{
+    auto path = TryAStar(g, startWorld, endWorld, exclFrom, exclTo, 80);
+    if (!path.empty()) return path;
+    path = TryAStar(g, startWorld, endWorld, exclFrom, exclTo, 200);
+    if (!path.empty()) return path;
+    path = TryAStar(g, startWorld, endWorld, exclFrom, exclTo, 400);
+    return path;
+}
+
+// ============================================================================
+// 核心路由（修复：目标节点入口也做端口偏移）
+// ============================================================================
+static std::vector<<ImVec2> RouteEdgeWithRepulsion(GraphLayout& g, int edgeIdx,
+                                                  const std::map<int,int>& outDeg,
+                                                  const std::map<int,int>& inDeg) {
+    auto& e = g.edges[edgeIdx];
+    const auto& src = g.nodes[e.from];
+    const auto& dst = g.nodes[e.to];
+    int totalOut = outDeg.count(e.from) ? outDeg.at(e.from) : 1;
+    int totalIn  = inDeg.count(e.to)  ? inDeg.at(e.to)  : 1;
+
+    // 修复：起终点都做端口偏移，天然错开
+    float outPortOff = CalcPortOffset(e.portIndex,    totalOut, src.size.x);
+    float inPortOff  = CalcPortOffset(e.inPortIndex,  totalIn,  dst.size.x);
+
+    ImVec2 startPort(src.GetBottomPort().x + outPortOff, src.GetBottomPort().y);
+    ImVec2 endPort  (dst.GetTopPort().x    + inPortOff,  dst.GetTopPort().y);
+
+    ImVec2 entryPoint, exitPoint;
+    bool foundEntry = false, foundExit = false;
+
+    // 查找进入管道的入口点（从 startPort 向下搜索）
+    for (int i = 1; i < 200; ++i) {
+        float ty = startPort.y + i * GRID_SIZE;
+        int gy = ToGrid(ty);
+        int gx = ToGrid(startPort.x);
+        ImVec2 testPt(startPort.x, ToWorld(gy));
+        if (IsInPipeCorridor(g, gx, gy) &&
+            !IsPointBlocked(g, testPt.x, testPt.y, e.from, e.to) &&
+            IsSegmentClear(g, startPort, testPt, e.from, e.to)) {
+            entryPoint = testPt;
+            foundEntry = true;
+            break;
+        }
+    }
+    // 查找离开管道的出口点（从 endPort 向上搜索）
+    for (int i = 1; i < 200; ++i) {
+        float ty = endPort.y - i * GRID_SIZE;
+        int gy = ToGrid(ty);
+        int gx = ToGrid(endPort.x);
+        ImVec2 testPt(endPort.x, ToWorld(gy));
+        if (IsInPipeCorridor(g, gx, gy) &&
+            !IsPointBlocked(g, testPt.x, testPt.y, e.from, e.to) &&
+            IsSegmentClear(g, testPt, endPort, e.from, e.to)) {
+            exitPoint = testPt;
+            foundExit = true;
+            break;
+        }
+    }
+
+    if (!foundEntry || !foundExit) {
+        return CleanPath(CreateSafeExternalPath(g, e.from, e.to, startPort, endPort));
+    }
+
+    auto pipePath = PipeConstrainedAStar(g, entryPoint, exitPoint, e.from, e.to);
+    if (pipePath.empty()) {
+        return CleanPath(CreateSafeExternalPath(g, e.from, e.to, startPort, endPort));
+    }
+
+    std::vector<<ImVec2> fullPath;
+    fullPath.push_back(startPort);
+    fullPath.push_back(entryPoint);
+    bool first = true;
+    for (const auto& p : pipePath) {
+        if (first && std::fabs(p.x - entryPoint.x) < 1.0f && std::fabs(p.y - entryPoint.y) < 1.0f) {
+            first = false; continue;
+        }
+        fullPath.push_back(p);
+    }
+    while (fullPath.size() >= 2 &&
+           std::fabs(fullPath.back().x - exitPoint.x) < 1.0f &&
+           std::fabs(fullPath.back().y - exitPoint.y) < 1.0f)
+        fullPath.pop_back();
+    fullPath.push_back(exitPoint);
+    fullPath.push_back(endPort);
+
+    fullPath = CleanPath(fullPath);
+
+    auto nodeSafe = AdjustPathAwayFromNodes(g, fullPath, e.from, e.to);
+    if (nodeSafe.empty() || IsPathBlocked(g, nodeSafe, e.from, e.to))
+        nodeSafe = CreateSafeExternalPath(g, e.from, e.to, startPort, endPort);
+
+    auto finalPath = ResolveOverlapWithOccupancy(g, nodeSafe, e.from, e.to);
+    if (finalPath.empty()) finalPath = nodeSafe;
+
+    // 注册占用
+    for (size_t i = 1; i < finalPath.size(); ++i) {
+        const auto& a = finalPath[i-1];
+        const auto& b = finalPath[i];
+        EdgeSegment seg;
+        if (std::fabs(a.x - b.x) < 1.0f) {
+            seg.type = SegType::VERTICAL; seg.fixedCoord = a.x;
+            seg.minCoord = std::min(a.y, b.y); seg.maxCoord = std::max(a.y, b.y);
+        } else {
+            seg.type = SegType::HORIZONTAL; seg.fixedCoord = a.y;
+            seg.minCoord = std::min(a.x, b.x); seg.maxCoord = std::max(a.x, b.x);
+        }
+        g.occupancy.AddSegment(seg);
+    }
+    return finalPath;
+}
+
+// ============================================================================
+// 主构建流程（修复：增加入边端口分配）
+// ============================================================================
+void BuildCFGGraph(CFGGraph& graph, uint64_t funcAddress,
+                   const std::vector<<AsmInstruction>& instructions) {
+    graph.Clear(); graph.funcAddress = funcAddress;
+    if(instructions.empty()) return;
+    graph.funcName = g_Layout.currentFunctionName.empty() ? "unknown" : g_Layout.currentFunctionName;
+    GraphLayout& layout = g_layouts[funcAddress];
+    layout.Clear();
+
+    // ---------- 基本块识别 ----------
+    std::vector<uint64_t> blockStarts;
+    blockStarts.push_back(instructions.front().address);
+    for(const auto& inst : instructions){
+        if(!inst.isBranch) continue;
+        if(inst.branchTarget != 0){
+            uint64_t t = inst.branchTarget;
+            if(t >= instructions.front().address && t <= instructions.back().address + 16)
+                if(std::find(blockStarts.begin(), blockStarts.end(), t) == blockStarts.end())
+                    blockStarts.push_back(t);
+        }
+        uint64_t nxt = inst.address + inst.bytes;
+        if(nxt >= instructions.front().address && nxt <= instructions.back().address + 16)
+            if(std::find(blockStarts.begin(), blockStarts.end(), nxt) == blockStarts.end())
+                blockStarts.push_back(nxt);
+    }
+    std::sort(blockStarts.begin(), blockStarts.end());
+
+    // ---------- 创建节点 ----------
+    ImFont* font = ImGui::GetFont();
+    float fontSize = ImGui::GetFontSize();
+    float charWidth = fontSize * 0.55f;
+    float lineHeight = fontSize * 1.4f;
+    const float TITLE_H = lineHeight * 1.5f;
+    const float PAD_X = 20.0f, PAD_Y = 16.0f;
+    uint64_t baseAddr = instructions.front().address;
+    std::unordered_map<uint64_t, int> addr2idx;
+
+    for(size_t i = 0; i < blockStarts.size(); i++){
+        CFGNodeEx nd;
+        nd.startAddr = blockStarts[i];
+        nd.endAddr = (i+1 < blockStarts.size()) ? blockStarts[i+1] : instructions.back().address + instructions.back().bytes;
+        nd.isEntry = (i == 0);
+        nd.isExit  = (i+1 >= blockStarts.size());
+
+        std::string asmText;
+        int lineCount = 0;
+        float maxLineWidth = 0.0f;
+        for(const auto& inst : instructions){
+            if(inst.address >= nd.startAddr && inst.address < nd.endAddr){
+                char buf[256];
+                std::string off = FormatOffsetStr(inst.address, baseAddr);
+                snprintf(buf, sizeof(buf), "%s %s", off.c_str(), inst.mnemonic.c_str());
+                asmText += buf; asmText += "\n";
+                lineCount++;
+                float w = (float)strlen(buf) * charWidth;
+                if(w > maxLineWidth) maxLineWidth = w;
+            }
+        }
+        if(!asmText.empty() && asmText.back() == '\n') asmText.pop_back();
+        nd.disassembly = asmText;
+        nd.size.x = std::max(NODE_MIN_WIDTH, maxLineWidth + PAD_X * 2.5f);
+        nd.size.y = std::max(NODE_MIN_HEIGHT, TITLE_H + PAD_Y * 2 + lineCount * lineHeight + 10.0f);
+        if(nd.isEntry){ nd.bgColor = IM_COL32(42,62,42,255); nd.borderColor = IM_COL32(70,190,70,255); }
+        else if(nd.isExit){ nd.bgColor = IM_COL32(62,42,42,255); nd.borderColor = IM_COL32(190,70,70,255); }
+        addr2idx[nd.startAddr] = (int)layout.nodes.size();
+        layout.nodes.push_back(nd);
+    }
+
+    // ---------- 创建边 ----------
+    layout.succs.resize(layout.nodes.size()); layout.preds.resize(layout.nodes.size());
+    for(size_t i = 0; i < layout.nodes.size(); i++){
+        const AsmInstruction* last = nullptr;
+        for(const auto& inst : instructions)
+            if(inst.address >= layout.nodes[i].startAddr && inst.address < layout.nodes[i].endAddr)
+                if(!last || inst.address > last->address) last = &inst;
+        if(!last) continue;
+        bool isJump = last->isJump, isCall = last->isCall, isBranch = last->isBranch;
+        bool isRet = IsReturnInstruction(last->mnemonic);
+        if((isJump || isBranch || isCall) && last->branchTarget != 0){
+            auto it = addr2idx.find(last->branchTarget);
+            if(it != addr2idx.end() && it->second != (int)i){
+                CFGEdgeEx e; e.from = (int)i; e.to = it->second;
+                if(isCall) e.type = CFGEdgeType::Call;
+                else if(isBranch) e.type = CFGEdgeType::True;
+                else e.type = CFGEdgeType::Jump;
+                layout.edges.push_back(e);
+                layout.succs[i].push_back(it->second);
+                layout.preds[it->second].push_back((int)i);
+            }
+        }
+        if(!isJump && !isRet){
+            uint64_t nxt = last->address + last->bytes;
+            auto it = addr2idx.find(nxt);
+            if(it != addr2idx.end() && it->second != (int)i){
+                CFGEdgeEx e; e.from = (int)i; e.to = it->second;
+                e.type = isBranch ? CFGEdgeType::False : CFGEdgeType::Normal;
+                layout.edges.push_back(e);
+                layout.succs[i].push_back(it->second);
+                layout.preds[it->second].push_back((int)i);
+            } else if(i+1 < layout.nodes.size()){
+                CFGEdgeEx e; e.from = (int)i; e.to = (int)(i+1); e.type = CFGEdgeType::Normal;
+                layout.edges.push_back(e);
+                layout.succs[i].push_back((int)(i+1));
+                layout.preds[i+1].push_back((int)i);
+            }
+        }
+    }
+    for(size_t i = 0; i < layout.nodes.size(); i++)
+        if(layout.succs[i].empty() && i+1 < layout.nodes.size() && !layout.nodes[i].isExit){
+            CFGEdgeEx e; e.from = (int)i; e.to = (int)(i+1); e.type = CFGEdgeType::Normal;
+            layout.edges.push_back(e); layout.succs[i].push_back((int)(i+1)); layout.preds[i+1].push_back((int)i);
+        }
+
+    // ---------- 布局 ----------
+    AssignLayersTopo(layout);
+    CreateLayers(layout);
+    AssignCoordinates(layout);
+
+    // ---------- 构建管道 ----------
+    BuildPipes(layout);
+
+    // ---------- 回边标记 ----------
+    for(auto& e : layout.edges)
+        if(layout.nodes[e.to].layer <= layout.nodes[e.from].layer)
+            e.is_reversed = true;
+
+    // ---------- 出边端口分配 ----------
+    std::map<int, std::vector<std::pair<int,int>>> outEdgesByNode;
+    for(int i = 0; i < (int)layout.edges.size(); ++i){
+        auto& e = layout.edges[i];
+        if(layout.nodes[e.from].is_dummy || layout.nodes[e.to].is_dummy) continue;
+        float tx = layout.nodes[e.to].x + layout.nodes[e.to].size.x * 0.5f;
+        outEdgesByNode[e.from].push_back({(int)tx, i});
+    }
+    for(auto& kv : outEdgesByNode){
+        auto& vec = kv.second;
+        std::sort(vec.begin(), vec.end(), [](auto& a, auto& b){ return a.first < b.first; });
+        for(int i = 0; i < (int)vec.size(); ++i){
+            layout.edges[vec[i].second].portIndex = i;
+        }
+    }
+
+    // ---------- 修复：入边端口分配 ----------
+    std::map<int, std::vector<std::pair<int,int>>> inEdgesByNode;
+    for(int i = 0; i < (int)layout.edges.size(); ++i){
+        auto& e = layout.edges[i];
+        if(layout.nodes[e.from].is_dummy || layout.nodes[e.to].is_dummy) continue;
+        float sx = layout.nodes[e.from].x + layout.nodes[e.from].size.x * 0.5f;
+        inEdgesByNode[e.to].push_back({(int)sx, i});
+    }
+    for(auto& kv : inEdgesByNode){
+        auto& vec = kv.second;
+        std::sort(vec.begin(), vec.end(), [](auto& a, auto& b){ return a.first < b.first; });
+        for(int i = 0; i < (int)vec.size(); ++i){
+            layout.edges[vec[i].second].inPortIndex = i;
+        }
+    }
+
+    std::map<int,int> outDeg, inDeg;
+    for (const auto& e : layout.edges) {
+        outDeg[e.from]++;
+        inDeg[e.to]++;
+    }
+
+    // ---------- 边排序：回边优先，长距离优先 ----------
+    std::vector<int> edgeOrder(layout.edges.size());
+    std::iota(edgeOrder.begin(), edgeOrder.end(), 0);
+    std::sort(edgeOrder.begin(), edgeOrder.end(), [&](int a, int b) {
+        const auto& ea = layout.edges[a];
+        const auto& eb = layout.edges[b];
+        bool revA = ea.is_reversed, revB = eb.is_reversed;
+        if (revA != revB) return revA > revB;
+        float lenA = std::abs(layout.nodes[ea.from].x - layout.nodes[ea.to].x) +
+                     std::abs(layout.nodes[ea.from].y - layout.nodes[ea.to].y);
+        float lenB = std::abs(layout.nodes[eb.from].x - layout.nodes[eb.to].x) +
+                     std::abs(layout.nodes[eb.from].y - layout.nodes[eb.to].y);
+        return lenA > lenB;
+    });
+
+    // ---------- 执行路由 ----------
+    for (int idx : edgeOrder) {
+        auto& e = layout.edges[idx];
+        if (layout.nodes[e.from].is_dummy || layout.nodes[e.to].is_dummy) continue;
+        e.path = RouteEdgeWithRepulsion(layout, idx, outDeg, inDeg);
+    }
+
+    // ---------- 同步外部图 ----------
+    graph.nodes.clear(); graph.edges.clear();
+    for(const auto& nd : layout.nodes){
+        if(nd.is_dummy) continue;
+        CFGNode n; n.startAddr = nd.startAddr; n.endAddr = nd.endAddr; n.disassembly = nd.disassembly;
+        n.isEntry = nd.isEntry; n.isExit = nd.isExit; n.position = ImVec2(nd.x, nd.y); n.size = nd.size;
+        graph.nodes.push_back(n);
+    }
+    addr2idx.clear();
+    for(size_t i = 0; i < graph.nodes.size(); i++) addr2idx[graph.nodes[i].startAddr] = (int)i;
+    for(const auto& edge : layout.edges){
+        if(layout.nodes[edge.from].is_dummy || layout.nodes[edge.to].is_dummy) continue;
+        CFGEdge e; e.fromAddr = layout.nodes[edge.from].startAddr; e.toAddr = layout.nodes[edge.to].startAddr;
+        e.type = edge.type; graph.edges.push_back(e);
+    }
+    graph.valid = true;
+}
+
+// ============================================================================
+// 工具栏（含管道显示开关）
+// ============================================================================
+void RenderCFGToolbar(CFGViewState& tab, bool isWindowLevel) {
+    ImGui::PushID((int)(tab.funcAddress & 0xFFFFFFFF) ^ (isWindowLevel ? 0xAAAA : 0x5555));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.35f, 0.25f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.35f, 0.50f, 0.35f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.30f, 0.40f, 0.30f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrab, ImVec4(0.40f, 0.70f, 0.40f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_SliderGrabActive, ImVec4(0.50f, 0.80f, 0.50f, 1.0f));
+
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted("缩放:"); ImGui::SameLine();
+    if(ImGui::Button("-")) tab.zoom = std::max(0.3f, tab.zoom - 0.1f);
+    ImGui::SameLine(); ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.5f, 1.0f), "%.2fx", tab.zoom); ImGui::SameLine();
+    if(ImGui::Button("+")) tab.zoom = std::min(3.0f, tab.zoom + 0.1f); ImGui::SameLine();
+
+    ImGui::SetNextItemWidth(300.0f);
+    float zoomCopy = tab.zoom;
+    if(ImGui::SliderFloat("##zoomslider", &zoomCopy, 0.3f, 3.0f, "%.1fx")) tab.zoom = zoomCopy; ImGui::SameLine();
+
+    if(ImGui::Button("重置")) { tab.scroll = ImVec2(0,0); tab.zoom = 1.0f; g_selectedNodeByFunc[tab.funcAddress] = 0; } ImGui::SameLine();
+    if(ImGui::Button("刷新")) { BuildCFGGraph(tab.graph, tab.funcAddress, g_AsmView.instructions); tab.valid = tab.graph.valid; } ImGui::SameLine();
+
+    uint64_t sel = g_selectedNodeByFunc[tab.funcAddress];
+    if(!tab.graph.nodes.empty() && sel != 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "+0x%llX", (unsigned long long)(sel - tab.graph.nodes[0].startAddr));
+    else
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 0.7f), "单击高亮");
+
+    ImGui::SameLine();
+    auto itLayout = g_layouts.find(tab.funcAddress);
+    if (itLayout != g_layouts.end()) {
+        bool show = itLayout->second.showPipes;
+        if (ImGui::Button(show ? "隐藏管道" : "显示管道"))
+            itLayout->second.showPipes = !show;
+    }
+
+    ImGui::PopStyleColor(5); ImGui::PopID();
+}
+
+// ============================================================================
+// 画布渲染（增加管道绘制 + 边渲染优化）
+// ============================================================================
+void RenderCFGCanvas(CFGViewState& tabState) {
+    if(!tabState.graph.valid) return;
+    auto itLayout = g_layouts.find(tabState.funcAddress);
+    if(itLayout == g_layouts.end()) return;
+    GraphLayout& layout = itLayout->second;
+
+    ImGui::BeginChild("##CFGCanvasArea", ImVec2(0,0), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImVec2 canvasPos = ImGui::GetCursorScreenPos();
+    ImVec2 canvasSize = ImGui::GetContentRegionAvail();
+    if(canvasSize.x < 50) canvasSize.x = 50;
+    if(canvasSize.y < 50) canvasSize.y = 50;
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    ImGuiIO& io = ImGui::GetIO();
+    drawList->AddRectFilled(canvasPos, ImVec2(canvasPos.x+canvasSize.x, canvasPos.y+canvasSize.y), IM_COL32(25,25,30,255));
+    drawList->PushClipRect(canvasPos, ImVec2(canvasPos.x+canvasSize.x, canvasPos.y+canvasSize.y), true);
+
+    float& lastZoom = s_lastZoom[tabState.funcAddress];
+    if(lastZoom > 0.0f && std::fabs(tabState.zoom - lastZoom) > 0.001f){
+        ImVec2 cc(canvasPos.x + canvasSize.x*0.5f, canvasPos.y + canvasSize.y*0.5f);
+        float ratio = lastZoom / tabState.zoom;
+        ImVec2 aw = ScreenToWorld(cc, canvasPos, tabState.scroll, lastZoom);
+        tabState.scroll.x = aw.x * (ratio - 1.0f) + tabState.scroll.x * ratio;
+        tabState.scroll.y = aw.y * (ratio - 1.0f) + tabState.scroll.y * ratio;
+    }
+    lastZoom = tabState.zoom;
+
+    ImGui::InvisibleButton("cfgCanvas", canvasSize,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
+    bool isHovered = ImGui::IsItemHovered(), isActive = ImGui::IsItemActive();
+    CFGDragState& ds = g_dragStates[tabState.funcAddress];
+    if(isActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)){
+        if(!ds.active){ ds.active = true; ds.startMouse = io.MousePos; ds.startScroll = tabState.scroll; }
+        tabState.scroll.x = ds.startScroll.x + (io.MousePos.x - ds.startMouse.x) / tabState.zoom;
+        tabState.scroll.y = ds.startScroll.y + (io.MousePos.y - ds.startMouse.y) / tabState.zoom;
+    }else ds.active = false;
+    if(io.MouseWheel != 0.0f && isHovered){
+        float zf = io.MouseWheel > 0.0f ? 1.08f : 0.93f;
+        tabState.zoom *= zf;
+        tabState.zoom = ClampFloat(tabState.zoom, 0.3f, 3.0f);
+    }
+
+    uint64_t& selectedAddr = g_selectedNodeByFunc[tabState.funcAddress];
+    if(ImGui::IsMouseClicked(0) && isHovered && !ImGui::IsMouseDragging(0, 5.0f)){
+        ImVec2 mw = ScreenToWorld(io.MousePos, canvasPos, tabState.scroll, tabState.zoom);
+        bool hit = false;
+        for(auto& node : tabState.graph.nodes){
+            if(mw.x >= node.position.x && mw.x <= node.position.x+node.size.x &&
+               mw.y >= node.position.y && mw.y <= node.position.y+node.size.y){
+                selectedAddr = node.startAddr; hit = true; break;
+            }
+        }
+        if(!hit) selectedAddr = 0;
+    }
+
+    // ---------- 绘制管道（半透明调试层） ----------
+    if (layout.showPipes) {
+        for (auto& hp : layout.hPipes) {
+            float screenY = WorldToScreen(ImVec2(0, hp.coord), canvasPos, tabState.scroll, tabState.zoom).y;
+            drawList->AddLine(ImVec2(canvasPos.x, screenY), ImVec2(canvasPos.x+canvasSize.x, screenY),
+                              IM_COL32(120, 120, 255, 90), 1.0f);
+        }
+        if (!layout.bottomPipe.occupied.empty()) {
+            float screenY = WorldToScreen(ImVec2(0, layout.bottomPipe.coord), canvasPos, tabState.scroll, tabState.zoom).y;
+            drawList->AddLine(ImVec2(canvasPos.x, screenY), ImVec2(canvasPos.x+canvasSize.x, screenY),
+                              IM_COL32(255, 180, 60, 100), 2.0f);
+        }
+        if (!layout.topPipe.occupied.empty()) {
+            float screenY = WorldToScreen(ImVec2(0, layout.topPipe.coord), canvasPos, tabState.scroll, tabState.zoom).y;
+            drawList->AddLine(ImVec2(canvasPos.x, screenY), ImVec2(canvasPos.x+canvasSize.x, screenY),
+                              IM_COL32(255, 180, 60, 100), 2.0f);
+        }
+        for (auto& vp : layout.vPipes) {
+            float screenX = WorldToScreen(ImVec2(vp.coord, 0), canvasPos, tabState.scroll, tabState.zoom).x;
+            drawList->AddLine(ImVec2(screenX, canvasPos.y), ImVec2(screenX, canvasPos.y+canvasSize.y),
+                              IM_COL32(100, 255, 180, 90), 1.0f);
+        }
+        if (!layout.rightTrunk.occupied.empty()) {
+            float trunkX = WorldToScreen(ImVec2(layout.rightTrunk.coord, 0), canvasPos, tabState.scroll, tabState.zoom).x;
+            drawList->AddLine(ImVec2(trunkX, canvasPos.y), ImVec2(trunkX, canvasPos.y+canvasSize.y),
+                              IM_COL32(255, 80, 80, 120), 2.5f);
+        }
+    }
+
+    // ---------- 绘制边 ----------
+    std::vector<const CFGEdgeEx*> normalEdges, highlightEdges;
+    std::unordered_map<uint64_t, int> addrToDisp;
+    for(size_t i = 0; i < tabState.graph.nodes.size(); i++) addrToDisp[tabState.graph.nodes[i].startAddr] = (int)i;
+    for(const auto& edge : layout.edges){
+        if(layout.nodes[edge.from].is_dummy || layout.nodes[edge.to].is_dummy) continue;
+        bool isChild = (selectedAddr != 0 && layout.nodes[edge.from].startAddr == selectedAddr);
+        bool isParent = (selectedAddr != 0 && layout.nodes[edge.to].startAddr == selectedAddr);
+        if(isChild || isParent) highlightEdges.push_back(&edge);
+        else normalEdges.push_back(&edge);
+    }
+
+    auto DrawEdge = [&](const CFGEdgeEx* edge, bool highlight){
+        std::vector<<ImVec2> sp;
+        for(const auto& p : edge->path) sp.push_back(WorldToScreen(p, canvasPos, tabState.scroll, tabState.zoom));
+        if(sp.size() < 2) return;
+        ImU32 ec; float th;
+        if(!highlight){
+            switch(edge->type){
+                case CFGEdgeType::True: ec = IM_COL32(0,230,0,255); break;
+                case CFGEdgeType::False:ec = IM_COL32(230,60,60,255); break;
+                case CFGEdgeType::Call: ec = IM_COL32(80,160,255,255); break;
+                case CFGEdgeType::Jump: ec = IM_COL32(255,170,60,255); break;
+                default: ec = IM_COL32(160,160,160,255);
+            }
+            th = std::max(STROKE_WIDTH, STROKE_WIDTH * tabState.zoom);
+        }else{
+            bool isChild = (selectedAddr != 0 && layout.nodes[edge->from].startAddr == selectedAddr);
+            ec = isChild ? IM_COL32(100,200,255,255) : IM_COL32(200,140,255,255);
+            th = std::max(HIGHLIGHT_WIDTH, HIGHLIGHT_WIDTH * tabState.zoom);
+            ImU32 gc = isChild ? IM_COL32(80,180,255,90) : IM_COL32(180,120,255,90);
+            for(size_t i = 1; i < sp.size(); i++) drawList->AddLine(sp[i-1], sp[i], gc, th + 10.0f);
+        }
+        for(size_t i = 1; i < sp.size(); i++) drawList->AddLine(sp[i-1], sp[i], ec, th);
+        ImVec2 tip = sp.back(), base = sp[sp.size()-2];
+        ImVec2 dir(tip.x - base.x, tip.y - base.y);
+        float len = sqrtf(dir.x*dir.x + dir.y*dir.y);
+        if(len > 0.01f){
+            dir.x /= len; dir.y /= len;
+            float as = std::max(10.0f, ARROW_SIZE * tabState.zoom), aw = as * 0.6f;
+            ImVec2 perp(-dir.y * aw, dir.x * aw), ab(tip.x - dir.x * as, tip.y - dir.y * as);
+            drawList->AddTriangleFilled(tip, ImVec2(ab.x+perp.x, ab.y+perp.y),
+                                        ImVec2(ab.x-perp.x, ab.y-perp.y), ec);
+        }
+    };
+    for(auto* e : normalEdges) DrawEdge(e, false);
+    for(auto* e : highlightEdges) DrawEdge(e, true);
+
+    // ---------- 绘制节点 ----------
+    ImFont* font = ImGui::GetFont();
+    float fSize = ImGui::GetFontSize() * ClampFloat(tabState.zoom, 0.5f, 2.0f);
+    float lh = fSize * 1.4f;
+    const float MIN_SW = 120, MIN_SH = 60;
+
+    for(size_t i = 0; i < tabState.graph.nodes.size(); i++){
+        const auto& nd = tabState.graph.nodes[i];
+        ImVec2 mn = WorldToScreen(nd.position, canvasPos, tabState.scroll, tabState.zoom);
+        ImVec2 mx = WorldToScreen(ImVec2(nd.position.x + nd.size.x, nd.position.y + nd.size.y),
+                                  canvasPos, tabState.scroll, tabState.zoom);
+        if(mx.x < canvasPos.x || mn.x > canvasPos.x + canvasSize.x ||
+           mx.y < canvasPos.y || mn.y > canvasPos.y + canvasSize.y) continue;
+
+        float sw = mx.x - mn.x, sh = mx.y - mn.y;
+        if(sw < MIN_SW){ float c = (mn.x+mx.x)*0.5f; mn.x = c - MIN_SW*0.5f; mx.x = c + MIN_SW*0.5f; }
+        if(sh < MIN_SH){ float c = (mn.y+mx.y)*0.5f; mn.y = c - MIN_SH*0.5f; mx.y = c + MIN_SH*0.5f; }
+
+        bool sel = (nd.startAddr == selectedAddr);
+        ImU32 bg = IM_COL32(42,52,42,255), bd = IM_COL32(90,130,90,255);
+        ImU32 tBg = IM_COL32(52,72,52,255), tCol = IM_COL32(160,220,160,255), txCol = IM_COL32(190,210,190,255);
+        if(nd.isEntry){ bg = IM_COL32(42,62,42,255); bd = IM_COL32(70,190,70,255); tBg = IM_COL32(52,92,52,255); tCol = IM_COL32(140,255,140,255); }
+        if(nd.isExit) { bg = IM_COL32(62,42,42,255); bd = IM_COL32(190,70,70,255); tBg = IM_COL32(92,52,52,255); tCol = IM_COL32(255,140,140,255); }
+        if(sel){
+            bd = IM_COL32(255,220,100,255);
+            float gp = std::max(3.0f, 4.0f * tabState.zoom);
+            drawList->AddRect(ImVec2(mn.x-gp, mn.y-gp), ImVec2(mx.x+gp, mx.y+gp),
+                              IM_COL32(255,220,100,100),
+                              std::max(2.0f, 4.0f * tabState.zoom), 0, std::max(2.0f, 3.0f * tabState.zoom));
+        }
+
+        float rnd = std::max(2.0f, 3.0f * tabState.zoom);
+        float bt = std::max(1.0f, 1.5f * tabState.zoom);
+        float th = lh * 1.5f;
+        drawList->AddRectFilled(mn, mx, bg, rnd);
+        if(th > 2.0f) drawList->AddRectFilled(mn, ImVec2(mx.x, mn.y+th), tBg, rnd);
+        drawList->AddRect(mn, mx, bd, rnd, 0, bt);
+        float tb = mn.y + th;
+        if(tb < mx.y - 2.0f) drawList->AddLine(ImVec2(mn.x+rnd, tb), ImVec2(mx.x-rnd, tb), IM_COL32(70,110,70,180), 1.0f);
+
+        char tbuf[64];
+        if(!tabState.graph.nodes.empty()){
+            int64_t off = (int64_t)nd.startAddr - (int64_t)tabState.graph.nodes[0].startAddr;
+            if(off >= 0) snprintf(tbuf, sizeof(tbuf), "+0x%llX", (unsigned long long)off);
+            else snprintf(tbuf, sizeof(tbuf), "-0x%llX", (unsigned long long)(-off));
+        }else snprintf(tbuf, sizeof(tbuf), "0x%llX", (unsigned long long)nd.startAddr);
+        drawList->AddText(font, fSize, ImVec2(mn.x + 10*tabState.zoom, mn.y + 4*tabState.zoom), tCol, tbuf);
+
+        if(!nd.disassembly.empty() && tabState.zoom > 0.25f){
+            float tt = tb + 8*tabState.zoom, tbt = mx.y - 6*tabState.zoom;
+            float ah = tbt - tt;
+            if(ah > lh && tt < tbt){
+                ImVec2 tp(mn.x + 10*tabState.zoom, tt);
+                int ml = (int)(ah / lh), cl = 0;
+                std::string line; float mlw = (mx.x - mn.x) - 20*tabState.zoom;
+                for(size_t c = 0; c < nd.disassembly.size() && cl < ml; c++){
+                    if(nd.disassembly[c] == '\n'){
+                        if(!line.empty()){
+                            ImVec2 ls = ImGui::CalcTextSize(line.c_str());
+                            if(ls.x > mlw && line.length() > 15){
+                                float acw = ls.x / line.length();
+                                int vc = (int)((mlw - ImGui::CalcTextSize("...").x) / acw);
+                                vc = std::max(10, vc);
+                                drawList->AddText(font, fSize, tp, txCol, (line.substr(0, vc) + "...").c_str());
+                            }else drawList->AddText(font, fSize, tp, txCol, line.c_str());
+                        }
+                        tp.y += lh; cl++; line.clear();
+                        if(tp.y + lh > tbt) break;
+                    }else line += nd.disassembly[c];
+                }
+                if(!line.empty() && cl < ml && tp.y + lh <= tbt){
+                    ImVec2 ls = ImGui::CalcTextSize(line.c_str());
+                    if(ls.x > mlw && line.length() > 15){
+                        float acw = ls.x / line.length();
+                        int vc = (int)((mlw - ImGui::CalcTextSize("...").x) / acw);
+                        vc = std::max(10, vc);
+                        drawList->AddText(font, fSize, tp, txCol, (line.substr(0, vc) + "...").c_str());
+                    }else drawList->AddText(font, fSize, tp, txCol, line.c_str());
+                }
+            }
+        }
+    }
+
+    drawList->PopClipRect();
+    ImGui::EndChild();
+}
+
+// ============================================================================
+// CFGView 管理
+// ============================================================================
+void RenderCFGView() {
+    if(g_CFGManager.GetTabCount() == 0){ g_Layout.showCFGView = false; return; }
+    if(!g_Layout.showCFGView && g_CFGManager.GetTabCount() > 0) g_Layout.showCFGView = true;
+    ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_MenuBar;
+    if(!ImGui::Begin("控制流图##CFGView", &g_Layout.showCFGView, flags)){ ImGui::End(); return; }
+    if(ImGui::BeginMenuBar()){
+        if(ImGui::BeginMenu("视图")){
+            if(ImGui::MenuItem("刷新", "F5")){
+                if(g_Layout.currentCFGTab >= 0 && g_Layout.currentCFGTab < g_CFGManager.GetTabCount()){
+                    CFGViewState& tab = g_CFGManager.tabs[g_Layout.currentCFGTab];
+                    BuildCFGGraph(tab.graph, tab.funcAddress, g_AsmView.instructions);
+                    tab.valid = tab.graph.valid;
+                }
+            }
+            ImGui::Separator();
+            if(ImGui::MenuItem("重置视图", nullptr)){
+                if(g_Layout.currentCFGTab >= 0 && g_Layout.currentCFGTab < g_CFGManager.GetTabCount()){
+                    CFGViewState& tab = g_CFGManager.tabs[g_Layout.currentCFGTab];
+                    tab.scroll = ImVec2(0,0); tab.zoom = 1.0f; g_selectedNodeByFunc[tab.funcAddress] = 0;
+                }
+            }
+            ImGui::Separator();
+            if(ImGui::MenuItem("关闭视图", "Ctrl+W")) g_Layout.showCFGView = false;
+            ImGui::EndMenu();
+        }
+        ImGui::EndMenuBar();
+    }
+    for(auto& tab : g_CFGManager.tabs){
+        char tbuf[128]; snprintf(tbuf, sizeof(tbuf), "CFG: %s###CFG_%llx",
+                                 tab.graph.funcName.empty() ? "未知" : tab.graph.funcName.c_str(),
+                                 (unsigned long long)tab.funcAddress);
+        tab.title = tbuf;
+    }
+    ImGuiTabBarFlags tbf = ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_AutoSelectNewTabs;
+    if(ImGui::BeginTabBar("CFGTabBar", tbf)){
+        for(int i = 0; i < g_CFGManager.GetTabCount(); ){
+            CFGViewState& tab = g_CFGManager.tabs[i]; bool keepOpen = true;
+            if(ImGui::BeginTabItem(tab.title.c_str(), &keepOpen)){
+                g_Layout.currentCFGTab = i;
+                if(ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) keepOpen = false;
+                ImGui::Separator(); RenderCFGToolbar(tab, false); ImGui::Separator();
+                if(tab.graph.valid){
+                    RenderCFGCanvas(tab);
+                }else{
+                    ImVec2 avail = ImGui::GetContentRegionAvail();
+                    ImGui::BeginChild("##CFGInvalidArea", avail, false,
+                                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                    ImVec2 childSize = ImGui::GetContentRegionAvail();
+                    float cx = childSize.x * 0.5f;
+                    float cy = childSize.y * 0.5f;
+                    ImGui::SetCursorPos(ImVec2(cx - 80, cy - 30));
+                    ImGui::TextColored(ImVec4(0.8f, 0.4f, 0.4f, 1.0f), "CFG图无效，请重新生成");
+                    ImGui::SetCursorPos(ImVec2(cx - 75, cy + 10));
+                    if(ImGui::Button("生成CFG图", ImVec2(150, 35))){
+                        BuildCFGGraph(tab.graph, tab.funcAddress, g_AsmView.instructions);
+                        tab.valid = tab.graph.valid;
+                    }
+                    ImGui::EndChild();
+                }
+                ImGui::EndTabItem();
+            }
+            if(!keepOpen){
+                g_CFGManager.CloseCFGView(i);
+                if(g_Layout.currentCFGTab >= i && g_CFGManager.GetTabCount() > 0)
+                    g_Layout.currentCFGTab = std::max(0, g_Layout.currentCFGTab - 1);
+            }else i++;
+        }
+        ImGui::EndTabBar();
+    }else ImGui::TextColored(ImVec4(0.5f,0.5f,0.5f,1.0f), "没有打开的CFG视图");
+    ImGui::End();
+}
+
+// ============================================================================
+// CFGManager 实现
+// ============================================================================
+int CFGManager::CreateCFGView(uint64_t funcAddr, const std::string& funcName) {
+    for(int i = 0; i < (int)tabs.size(); i++) if(tabs[i].funcAddress == funcAddr && tabs[i].valid) return i;
+    CFGViewState newTab; newTab.funcAddress = funcAddr; newTab.title = "CFG##" + std::to_string(funcAddr);
+    newTab.valid = false; newTab.zoom = 1.0f; newTab.scroll = ImVec2(0,0);
+    tabs.push_back(newTab); return (int)tabs.size() - 1;
+}
+void CFGManager::CloseCFGView(int index) {
+    if(index >= 0 && index < (int)tabs.size()){ g_selectedNodeByFunc.erase(tabs[index].funcAddress); tabs.erase(tabs.begin()+index); }
+}
+bool CFGManager::HasOpenTabs() const { return !tabs.empty(); }
+int  CFGManager::GetTabCount() const { return (int)tabs.size(); }
+int  CFGManager::FindTabByAddress(uint64_t funcAddr) const {
+    for(int i = 0; i < (int)tabs.size(); i++) if(tabs[i].funcAddress == funcAddr && tabs[i].valid) return i;
+    return -1;
+}
+
