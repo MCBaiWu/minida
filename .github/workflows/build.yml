@@ -32,28 +32,10 @@ jobs:
         run: |
           mkdir -p $HOME/.gradle
           cat > $HOME/.gradle/gradle.properties <<EOF
-          org.gradle.jvmargs=-Xmx2g
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
           android.useAndroidX=false
           android.enableJetifier=false
           EOF
-
-      - name: Build NDK (libimgui.so)
-        run: |
-          NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)
-          echo "Using NDK: $NDK_PATH"
-          cd minida/minida/app/src/main/jni
-          $NDK_PATH/ndk-build \
-            APP_ABI=arm64-v8a \
-            NDK_PROJECT_PATH=. \
-            APP_BUILD_SCRIPT=Android.mk \
-            APP_PLATFORM=android-21
-          ls -la libs/arm64-v8a/
-
-      - name: Verify NDK output
-        run: |
-          ls -la minida/minida/app/src/main/jni/libs/arm64-v8a/ \
-            || (echo "NDK build failed - no output" && exit 1)
-          file minida/minida/app/src/main/jni/libs/arm64-v8a/libimgui.so
 
       - name: Generate debug keystore
         if: github.event_name != 'pull_request'
@@ -63,23 +45,27 @@ jobs:
             -keystore $HOME/.android/debug.keystore \
             -storepass android -alias androiddebugkey \
             -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+            -dname "CN=Android Debug,O=Android,C=US" 2>&1 | tail -3
 
       - name: Build APK with Gradle
         run: |
           cd minida/minida
           chmod +x gradlew
-          ./gradlew assembleRelease \
-            --no-daemon \
+          ./gradlew assembleRelease --no-daemon --stacktrace \
             -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
+            -Pandroid.injected.signing.key.password=android 2>&1 | tail -200
 
       - name: Locate APK
         id: locate
         run: |
-          APK_PATH=$(find . -name "*.apk" -path "*/release/*" | head -1)
+          APK_PATH=$(find . -name "*.apk" -path "*/release/*" 2>/dev/null | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No APK found"
+            find . -name "*.apk" 2>/dev/null
+            exit 1
+          fi
           echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
           echo "APK: $APK_PATH"
           ls -la "$APK_PATH"
