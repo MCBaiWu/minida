@@ -29,8 +29,7 @@ jobs:
         uses: android-actions/setup-android@v3
         with:
           sdk-version: '34'
-          ndk-version: 'r25c'
-          cmake-version: '3.22.1'
+          ndk-version: 'r21e'
 
       - name: Configure Gradle
         run: |
