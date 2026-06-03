@@ -43,11 +43,13 @@ jobs:
 
       - name: Build NDK (libimgui.so) via ndk-build
         run: |
+          set -x
           NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)
           echo "Using NDK: $NDK_PATH"
           ls $ANDROID_HOME/ndk/
           cd minida/minida/app/src/main/jni
-          $NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1 | tail -50
+          $NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk
+          echo "NKB_EXIT=$?"
           echo "--- LIBS DIR ---"
           ls -la libs/ 2>/dev/null || ls -la
           find . -name "libimgui.so" 2>/dev/null
