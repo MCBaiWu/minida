@@ -48,20 +48,20 @@ jobs:
           echo "Using NDK: $NDK_PATH"
           ls $ANDROID_HOME/ndk/
           cd minida/minida/app/src/main/jni
-          ( $NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1 ; echo "NKB_EXIT=$?" ) | tee /tmp/ndk.log
-          echo "NKB_FINAL_EXIT=$?"
+          bash -c "$NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1" > /tmp/ndk.log
+          NKB_EXIT=$?
+          echo "NKB_EXIT=$NKB_EXIT"
+          echo "===== NDK BUILD LOG (head 200) ====="
+          head -200 /tmp/ndk.log
+          echo "===== NDK BUILD LOG (tail 200) ====="
+          tail -200 /tmp/ndk.log
+          if [ $NKB_EXIT -ne 0 ]; then
+            echo "ndk-build failed with exit $NKB_EXIT"
+            exit $NKB_EXIT
+          fi
           echo "--- LIBS DIR ---"
           ls -la libs/ 2>/dev/null
-          echo "--- FIND libimgui ---"
           find . -name "libimgui.so" 2>/dev/null
-          # If failed, dump full log
-          if [ ! -f libs/arm64-v8a/libimgui.so ] && [ ! -f libs/libimgui.so ]; then
-            echo "=== FULL NDK LOG ==="
-            cat /tmp/ndk.log
-            exit 1
-          fi
-          echo "=== NDK log last 50 lines ==="
-          tail -50 /tmp/ndk.log
 
       - name: Generate debug keystore
         run: |
