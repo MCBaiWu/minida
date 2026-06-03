@@ -45,14 +45,11 @@ jobs:
         run: |
           NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)
           echo "Using NDK: $NDK_PATH"
-          echo "ANDROID_HOME=$ANDROID_HOME"
           ls $ANDROID_HOME/ndk/
           cd minida/minida/app/src/main/jni
-          # Application.mk already declares APP_ABI=arm64-v8a and APP_PLATFORM=android-18
-          $NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1 | tail -80
+          $NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1 | tail -50
           echo "--- LIBS DIR ---"
           ls -la libs/ 2>/dev/null || ls -la
-          echo "--- OBJ DIR ---"
           find . -name "libimgui.so" 2>/dev/null
 
       - name: Generate debug keystore
@@ -68,13 +65,18 @@ jobs:
         run: |
           cd minida/minida
           chmod +x gradlew
+          set +e
           ./gradlew clean assembleRelease --no-daemon --info \
             -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android 2>&1 | tail -200
-          echo "--- AFTER GRADLE ---"
+            -Pandroid.injected.signing.key.password=android > /tmp/gradle.log 2>&1
+          echo "exit=$?"
+          echo "--- last 200 lines of gradle log ---"
+          tail -200 /tmp/gradle.log
+          echo "--- APK SEARCH ---"
           find . -name "*.apk" 2>/dev/null
+          echo "--- BUILD DIRS ---"
           find app/build -type d 2>/dev/null | head -20
 
       - name: Locate APK
@@ -83,7 +85,7 @@ jobs:
           set +e
           APK_PATH=$(find . -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
-            echo "::error::No APK found anywhere"
+            echo "::error::No APK found"
             find . -name "*.apk" 2>/dev/null
             exit 1
           fi
