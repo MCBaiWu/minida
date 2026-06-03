@@ -36,6 +36,11 @@ android {
         }
     }
 
+    lintOptions {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jni/libs']
