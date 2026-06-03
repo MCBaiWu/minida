@@ -31,6 +31,11 @@ jobs:
           sdk-version: '34'
           ndk-version: 'r21e'
 
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          cache-disable-list: '**/build/**'
+
       - name: Configure Gradle
         run: |
           mkdir -p $HOME/.gradle
@@ -43,9 +48,9 @@ jobs:
 
       - name: Build NDK (libimgui.so) via ndk-build
         run: |
+          set -e
           NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)
           echo "Using NDK: $NDK_PATH"
-          ls $ANDROID_HOME/ndk/
           cd minida/minida/app/src/main/jni
           $NDK_PATH/ndk-build \
             NDK_PROJECT_PATH=. \
@@ -55,8 +60,8 @@ jobs:
             APP_PLATFORM=android-18 \
             APP_ABI=arm64-v8a
           echo "--- LIBS DIR ---"
-          ls -la libs/arm64-v8a/ 2>/dev/null
-          find . -name "libimgui.so" 2>/dev/null
+          ls -la libs/arm64-v8a/
+          find . -name "libimgui.so"
 
       - name: Generate debug keystore
         run: |
@@ -69,21 +74,20 @@ jobs:
 
       - name: Build APK with Gradle
         run: |
+          set -e
+          set -o pipefail
           cd minida/minida
           pwd
-          ls -la gradlew build.gradle 2>&1
+          ls -la gradlew gradle/wrapper/gradle-wrapper.jar
           chmod +x gradlew
-          ./gradlew clean assembleRelease --no-daemon --info \
+          ./gradlew clean assembleRelease --no-daemon --stacktrace \
             -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android 2>&1 | tail -300
+            -Pandroid.injected.signing.key.password=android
           echo "=== AFTER GRADLE ==="
           echo "=== APK SEARCH ==="
-          find . -name "*.apk" 2>/dev/null
-          echo "=== BUILD OUTPUT DIRS ==="
-          ls -la app/build/outputs/apk/ 2>/dev/null || true
-          find app/build -type d 2>/dev/null | head -20
+          find . -name "*.apk"
 
       - name: Locate APK
         id: locate

@@ -1,0 +1,22 @@
+# Build outputs
+/build
+/app/build
+/app/src/main/jni/obj/
+/app/src/main/jni/libs/arm64-v8a/
+
+# Gradle
+.gradle/
+local.properties
+.idea/
+
+# NDK build intermediates
+*.o
+*.o.d
+*.so
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
