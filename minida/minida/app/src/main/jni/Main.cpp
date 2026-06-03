@@ -145,6 +145,46 @@ void StartAnalysisThread(const std::string& filePath) {
 // 主渲染循环
 // ============================================================================
 
+// 软键盘 / 剪贴板全局状态（先于 extern "C" 块声明，供 DrawFrame / SurfaceCreated 使用）
+static JavaVM* g_jvm = nullptr;
+static std::string g_clipboardText;
+static char g_clipboardBuf[4096] = {};
+static bool g_wantTextInput = false;
+
+// ImGui 剪贴板回调：缓存到本地 + 同步到 Android 系统剪贴板
+static const char* ImGuiGetClipboardText(void*) {
+    return g_clipboardBuf;
+}
+
+static void ImGuiSetClipboardText(void*, const char* text) {
+    if (!text) return;
+    snprintf(g_clipboardBuf, sizeof(g_clipboardBuf), "%s", text);
+    g_clipboardText = text;
+
+    if (g_jvm) {
+        JNIEnv* env = nullptr;
+        bool attached = false;
+        if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+                attached = true;
+            }
+        }
+        if (env) {
+            jclass cls = env->FindClass("com/baiwu/imgui/Surface");
+            if (cls) {
+                jmethodID mid = env->GetStaticMethodID(cls, "nativeSetClipboard", "(Ljava/lang/String;)V");
+                if (mid) {
+                    jstring jstr = env->NewStringUTF(text);
+                    env->CallStaticVoidMethod(cls, mid, jstr);
+                    env->DeleteLocalRef(jstr);
+                }
+                env->DeleteLocalRef(cls);
+            }
+        }
+        if (attached) g_jvm->DetachCurrentThread();
+    }
+}
+
 extern "C" {
     JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_DrawFrame(JNIEnv *env, jobject thiz) {
         if (!initialized) {
@@ -316,45 +356,6 @@ extern "C" {
     }
 
     // ==================== 软键盘 / 物理键 / 剪贴板 JNI ====================
-
-    static JavaVM* g_jvm = nullptr;
-    static std::string g_clipboardText;
-    static char g_clipboardBuf[4096] = {};
-    static bool g_wantTextInput = false;
-
-    // ImGui 剪贴板回调：缓存到本地 + 同步到 Android 系统剪贴板
-    static const char* ImGuiGetClipboardText(void*) {
-        return g_clipboardBuf;
-    }
-
-    static void ImGuiSetClipboardText(void*, const char* text) {
-        if (!text) return;
-        snprintf(g_clipboardBuf, sizeof(g_clipboardBuf), "%s", text);
-        g_clipboardText = text;
-
-        if (g_jvm) {
-            JNIEnv* env = nullptr;
-            bool attached = false;
-            if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-                if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
-                    attached = true;
-                }
-            }
-            if (env) {
-                jclass cls = env->FindClass("com/baiwu/imgui/Surface");
-                if (cls) {
-                    jmethodID mid = env->GetStaticMethodID(cls, "nativeSetClipboard", "(Ljava/lang/String;)V");
-                    if (mid) {
-                        jstring jstr = env->NewStringUTF(text);
-                        env->CallStaticVoidMethod(cls, mid, jstr);
-                        env->DeleteLocalRef(jstr);
-                    }
-                    env->DeleteLocalRef(cls);
-                }
-            }
-            if (attached) g_jvm->DetachCurrentThread();
-        }
-    }
 
     // Android keycode (custom id) -> ImGuiKey
     static ImGuiKey AndroidKeyToImGuiKey(int key) {

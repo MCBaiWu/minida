@@ -43,24 +43,19 @@ jobs:
 
       - name: Build NDK (libimgui.so) via ndk-build
         run: |
-          set -x
           NDK_PATH=$(ls -d $ANDROID_HOME/ndk/* | sort -V | tail -1)
           echo "Using NDK: $NDK_PATH"
           ls $ANDROID_HOME/ndk/
           cd minida/minida/app/src/main/jni
-          bash -c "$NDK_PATH/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk 2>&1" > /tmp/ndk.log
-          NKB_EXIT=$?
-          echo "NKB_EXIT=$NKB_EXIT"
-          echo "===== NDK BUILD LOG (head 200) ====="
-          head -200 /tmp/ndk.log
-          echo "===== NDK BUILD LOG (tail 200) ====="
-          tail -200 /tmp/ndk.log
-          if [ $NKB_EXIT -ne 0 ]; then
-            echo "ndk-build failed with exit $NKB_EXIT"
-            exit $NKB_EXIT
-          fi
+          $NDK_PATH/ndk-build \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=Android.mk \
+            APP_APPLICATION_MK=Application.mk \
+            APP_STL=c++_static \
+            APP_PLATFORM=android-18 \
+            APP_ABI=arm64-v8a
           echo "--- LIBS DIR ---"
-          ls -la libs/ 2>/dev/null
+          ls -la libs/arm64-v8a/ 2>/dev/null
           find . -name "libimgui.so" 2>/dev/null
 
       - name: Generate debug keystore
