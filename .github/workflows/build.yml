@@ -63,17 +63,12 @@ jobs:
 
       - name: Build APK with Gradle
         run: |
-          cd minida/minida
+          cd minida/minida || exit 1
+          ls -la
+          echo "PWD=$(pwd)"
           chmod +x gradlew
-          set +e
-          ./gradlew clean assembleRelease --no-daemon --info \
-            -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
-            -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android > /tmp/gradle.log 2>&1
-          echo "exit=$?"
-          echo "--- last 200 lines of gradle log ---"
-          tail -200 /tmp/gradle.log
+          bash -c "./gradlew clean assembleRelease --no-daemon --info -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore -Pandroid.injected.signing.store.password=android -Pandroid.injected.signing.key.alias=androiddebugkey -Pandroid.injected.signing.key.password=android" 2>&1 | tee /tmp/gradle.log | tail -300
+          echo "GRADLE_EXIT=${PIPESTATUS[0]}"
           echo "--- APK SEARCH ---"
           find . -name "*.apk" 2>/dev/null
           echo "--- BUILD DIRS ---"
