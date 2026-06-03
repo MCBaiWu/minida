@@ -63,15 +63,20 @@ jobs:
 
       - name: Build APK with Gradle
         run: |
-          cd minida/minida || exit 1
-          ls -la
-          echo "PWD=$(pwd)"
+          cd minida/minida
+          pwd
+          ls -la gradlew build.gradle 2>&1
           chmod +x gradlew
-          bash -c "./gradlew clean assembleRelease --no-daemon --info -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore -Pandroid.injected.signing.store.password=android -Pandroid.injected.signing.key.alias=androiddebugkey -Pandroid.injected.signing.key.password=android" 2>&1 | tee /tmp/gradle.log | tail -300
-          echo "GRADLE_EXIT=${PIPESTATUS[0]}"
-          echo "--- APK SEARCH ---"
+          ./gradlew clean assembleRelease --no-daemon --info \
+            -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android 2>&1 | tail -300
+          echo "=== AFTER GRADLE ==="
+          echo "=== APK SEARCH ==="
           find . -name "*.apk" 2>/dev/null
-          echo "--- BUILD DIRS ---"
+          echo "=== BUILD OUTPUT DIRS ==="
+          ls -la app/build/outputs/apk/ 2>/dev/null || true
           find app/build -type d 2>/dev/null | head -20
 
       - name: Locate APK
