@@ -56,7 +56,6 @@ jobs:
           find . -name "libimgui.so" 2>/dev/null
 
       - name: Generate debug keystore
-        if: github.event_name != 'pull_request'
         run: |
           mkdir -p $HOME/.android
           keytool -genkeypair -v \
@@ -69,18 +68,22 @@ jobs:
         run: |
           cd minida/minida
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace \
+          ./gradlew clean assembleRelease --no-daemon --info \
             -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
             -Pandroid.injected.signing.store.password=android \
             -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android 2>&1 | tail -100
+            -Pandroid.injected.signing.key.password=android 2>&1 | tail -200
+          echo "--- AFTER GRADLE ---"
+          find . -name "*.apk" 2>/dev/null
+          find app/build -type d 2>/dev/null | head -20
 
       - name: Locate APK
         id: locate
         run: |
-          APK_PATH=$(find . -name "*.apk" -path "*/release/*" 2>/dev/null | head -1)
+          set +e
+          APK_PATH=$(find . -name "*.apk" 2>/dev/null | head -1)
           if [ -z "$APK_PATH" ]; then
-            echo "::error::No APK found"
+            echo "::error::No APK found anywhere"
             find . -name "*.apk" 2>/dev/null
             exit 1
           fi
