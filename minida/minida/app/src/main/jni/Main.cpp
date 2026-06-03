@@ -213,6 +213,9 @@ extern "C" {
         glClear(GL_COLOR_BUFFER_BIT);
 
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // 同步 WantTextInput 给 Java 端，控制软键盘弹/收
+        g_wantTextInput = io.WantTextInput;
     }
 
     JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_ShutDown(JNIEnv *env, jobject thiz) {
@@ -236,11 +239,21 @@ extern "C" {
             return;
         }
 
+        // 保存 JavaVM 供剪贴板回调跨线程使用
+        if (env) {
+            env->GetJavaVM(&g_jvm);
+        }
+
         ImGuiIO& io = ImGui::GetIO();
         io.DisplaySize = ImVec2((float)glWidth, (float)glHeight);
         io.ConfigWindowsMoveFromTitleBarOnly = true;
         io.IniFilename = NULL;
         io.ConfigDebugIsDebuggerPresent = false;
+
+        // 挂接剪贴板回调
+        io.SetClipboardTextFn = ImGuiSetClipboardText;
+        io.GetClipboardTextFn = ImGuiGetClipboardText;
+        io.ClipboardUserData = nullptr;
 
         ImGui_ImplOpenGL3_Init("#version 300 es");
 
@@ -252,8 +265,6 @@ extern "C" {
 
         SetupIDATheme();
         fileBrowser.SetRootPath("/sdcard");
-
-        // Disassembler 将在加载文件后根据ELF架构自动初始化
 
         g_UI.AddLog("ELF Analyst Pro 启动完成");
         g_UI.AddLog("请选择文件进行分析");
@@ -302,5 +313,183 @@ extern "C" {
             SetupIDATheme();
             LOGI("UI scale set to: %f", g_Layout.uiScale);
         }
+    }
+
+    // ==================== 软键盘 / 物理键 / 剪贴板 JNI ====================
+
+    static JavaVM* g_jvm = nullptr;
+    static std::string g_clipboardText;
+    static char g_clipboardBuf[4096] = {};
+    static bool g_wantTextInput = false;
+
+    // ImGui 剪贴板回调：缓存到本地 + 同步到 Android 系统剪贴板
+    static const char* ImGuiGetClipboardText(void*) {
+        return g_clipboardBuf;
+    }
+
+    static void ImGuiSetClipboardText(void*, const char* text) {
+        if (!text) return;
+        snprintf(g_clipboardBuf, sizeof(g_clipboardBuf), "%s", text);
+        g_clipboardText = text;
+
+        if (g_jvm) {
+            JNIEnv* env = nullptr;
+            bool attached = false;
+            if (g_jvm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
+                if (g_jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+                    attached = true;
+                }
+            }
+            if (env) {
+                jclass cls = env->FindClass("com/baiwu/imgui/Surface");
+                if (cls) {
+                    jmethodID mid = env->GetStaticMethodID(cls, "nativeSetClipboard", "(Ljava/lang/String;)V");
+                    if (mid) {
+                        jstring jstr = env->NewStringUTF(text);
+                        env->CallStaticVoidMethod(cls, mid, jstr);
+                        env->DeleteLocalRef(jstr);
+                    }
+                    env->DeleteLocalRef(cls);
+                }
+            }
+            if (attached) g_jvm->DetachCurrentThread();
+        }
+    }
+
+    // Android keycode (custom id) -> ImGuiKey
+    static ImGuiKey AndroidKeyToImGuiKey(int key) {
+        switch (key) {
+            case 0:   return ImGuiKey_Tab;
+            case 1:   return ImGuiKey_LeftArrow;
+            case 2:   return ImGuiKey_RightArrow;
+            case 3:   return ImGuiKey_DownArrow;
+            case 4:   return ImGuiKey_UpArrow;
+            case 5:   return ImGuiKey_LeftShift;
+            case 6:   return ImGuiKey_RightShift;
+            case 7:   return ImGuiKey_LeftCtrl;
+            case 8:   return ImGuiKey_RightCtrl;
+            case 9:   return ImGuiKey_LeftAlt;
+            case 10:  return ImGuiKey_RightAlt;
+            case 11:  return ImGuiKey_CapsLock;
+            case 12:  return ImGuiKey_ScrollLock;
+            case 13:  return ImGuiKey_NumLock;
+            case 14:  return ImGuiKey_PrintScreen;
+            case 15:  return ImGuiKey_None;
+            case 16:  return ImGuiKey_Insert;
+            case 17:  return ImGuiKey_Pause;
+            case 19:  return ImGuiKey_Home;
+            case 20:  return ImGuiKey_End;
+            case 21:  return ImGuiKey_PageUp;
+            case 22:  return ImGuiKey_PageDown;
+            case 23:  return ImGuiKey_Delete;
+            case 29:  return ImGuiKey_A;
+            case 30:  return ImGuiKey_B;
+            case 31:  return ImGuiKey_C;
+            case 32:  return ImGuiKey_D;
+            case 33:  return ImGuiKey_E;
+            case 34:  return ImGuiKey_F;
+            case 35:  return ImGuiKey_G;
+            case 36:  return ImGuiKey_H;
+            case 37:  return ImGuiKey_I;
+            case 38:  return ImGuiKey_J;
+            case 39:  return ImGuiKey_K;
+            case 40:  return ImGuiKey_L;
+            case 41:  return ImGuiKey_M;
+            case 42:  return ImGuiKey_N;
+            case 43:  return ImGuiKey_O;
+            case 44:  return ImGuiKey_P;
+            case 45:  return ImGuiKey_Q;
+            case 46:  return ImGuiKey_R;
+            case 47:  return ImGuiKey_S;
+            case 48:  return ImGuiKey_T;
+            case 49:  return ImGuiKey_U;
+            case 50:  return ImGuiKey_V;
+            case 51:  return ImGuiKey_W;
+            case 52:  return ImGuiKey_X;
+            case 53:  return ImGuiKey_Y;
+            case 54:  return ImGuiKey_Z;
+            case 55:  return ImGuiKey_Comma;
+            case 56:  return ImGuiKey_Period;
+            case 59:  return ImGuiKey_Space;
+            case 61:  return ImGuiKey_Enter;
+            case 62:  return ImGuiKey_Backspace;
+            case 63:  return ImGuiKey_GraveAccent;
+            case 66:  return ImGuiKey_Enter;
+            case 67:  return ImGuiKey_Backspace;
+            case 75:  return ImGuiKey_Keypad0;
+            case 76:  return ImGuiKey_Keypad1;
+            case 77:  return ImGuiKey_Keypad2;
+            case 78:  return ImGuiKey_Keypad3;
+            case 79:  return ImGuiKey_Keypad4;
+            case 80:  return ImGuiKey_Keypad5;
+            case 81:  return ImGuiKey_Keypad6;
+            case 82:  return ImGuiKey_Keypad7;
+            case 83:  return ImGuiKey_Keypad8;
+            case 84:  return ImGuiKey_Keypad9;
+            case 111: return ImGuiKey_Escape;
+            case 112: return ImGuiKey_F1;
+            case 113: return ImGuiKey_F2;
+            case 114: return ImGuiKey_F3;
+            case 115: return ImGuiKey_F4;
+            case 116: return ImGuiKey_F5;
+            case 117: return ImGuiKey_F6;
+            case 118: return ImGuiKey_F7;
+            case 119: return ImGuiKey_F8;
+            case 120: return ImGuiKey_F9;
+            case 121: return ImGuiKey_F10;
+            case 122: return ImGuiKey_F11;
+            case 123: return ImGuiKey_F12;
+            default:  return ImGuiKey_None;
+        }
+    }
+
+    JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_KeyEvent(JNIEnv*, jclass, jint key, jboolean down) {
+        if (!initialized) return;
+        ImGuiIO& io = ImGui::GetIO();
+        ImGuiKey imguiKey = AndroidKeyToImGuiKey(key);
+        if (imguiKey != ImGuiKey_None) {
+            io.AddKeyEvent(imguiKey, down != JNI_FALSE);
+        }
+        // 修饰键
+        if (key == 7 || key == 8)  io.AddKeyEvent(ImGuiMod_Ctrl, down != JNI_FALSE);
+        if (key == 5 || key == 6)  io.AddKeyEvent(ImGuiMod_Shift, down != JNI_FALSE);
+        if (key == 9 || key == 10) io.AddKeyEvent(ImGuiMod_Alt, down != JNI_FALSE);
+    }
+
+    JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_CharEvent(JNIEnv*, jclass, jint c) {
+        if (!initialized) return;
+        ImGuiIO& io = ImGui::GetIO();
+        io.AddInputCharacter((unsigned int)c);
+    }
+
+    JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_TextInput(JNIEnv* env, jclass, jstring text) {
+        if (!initialized) return;
+        const char* str = env->GetStringUTFChars(text, nullptr);
+        if (str) {
+            ImGuiIO& io = ImGui::GetIO();
+            for (const char* p = str; *p; p++) {
+                io.AddInputCharacter((unsigned int)*p);
+            }
+            env->ReleaseStringUTFChars(text, str);
+        }
+    }
+
+    JNIEXPORT jboolean JNICALL Java_com_baiwu_imgui_Surface_WantTextInput(JNIEnv*, jclass) {
+        if (!initialized) return JNI_FALSE;
+        return g_wantTextInput ? JNI_TRUE : JNI_FALSE;
+    }
+
+    JNIEXPORT void JNICALL Java_com_baiwu_imgui_Surface_SetClipboardText(JNIEnv* env, jclass, jstring text) {
+        if (!initialized) return;
+        const char* str = env->GetStringUTFChars(text, nullptr);
+        if (str) {
+            g_clipboardText = str;
+            snprintf(g_clipboardBuf, sizeof(g_clipboardBuf), "%s", str);
+            env->ReleaseStringUTFChars(text, str);
+        }
+    }
+
+    JNIEXPORT jstring JNICALL Java_com_baiwu_imgui_Surface_GetClipboardText(JNIEnv* env, jclass) {
+        return env->NewStringUTF(g_clipboardText.c_str());
     }
 }

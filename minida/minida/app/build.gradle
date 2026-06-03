@@ -10,12 +10,34 @@ android {
         targetSdkVersion 26
         versionCode 1
         versionName "1.0"
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (project.hasProperty('android.injected.signing.store.file')) {
+                storeFile file(android.injected.signing.store.file)
+                storePassword android.injected.signing.store.password
+                keyAlias android.injected.signing.key.alias
+                keyPassword android.injected.signing.key.password
+            }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
+        }
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['src/main/jni/libs']
         }
     }
 }

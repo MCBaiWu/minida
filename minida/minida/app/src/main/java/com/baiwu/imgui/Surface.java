@@ -1,250 +1,345 @@
 package com.baiwu.imgui;
 
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.opengl.GLES30;
 import android.opengl.GLSurfaceView;
-import android.opengl.Matrix;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.Editable;
+import android.text.TextWatcher;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.View;
+import android.view.inputmethod.EditorInfo;
+import android.view.inputmethod.InputMethodManager;
+import android.widget.EditText;
+import android.widget.FrameLayout;
+import android.widget.TextView;
+
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
-/*
- * simple extention of the GLsurfaceview.  basically setup to use opengl 3.0
- * and set some configs.  This would be where the touch listener is setup to do something.
- *
- * It also declares and sets the render.
+/**
+ * GLSurfaceView + Renderer for ImGui rendering.
+ * Adds soft keyboard input support via a hidden EditText,
+ * physical key / DPAD support, and clipboard sync.
  */
-
 public class Surface extends GLSurfaceView implements GLSurfaceView.Renderer {
 
-    
-static {
-        System.loadLibrary("imgui"); // 确保加载了 imgui 的本地库
+    private static final String TAG = "minida";
+    private static Surface instance;
+    private EditText hiddenInput;
+    private FrameLayout container;
+    private String lastText = "";
+    private boolean keyboardVisible = false;
+    private ClipboardManager clipboardManager;
+
+    static {
+        System.loadLibrary("imgui");
     }
-    
+
     public Surface(Context context) {
         super(context);
-        // Create an OpenGL ES 3.0 context.
+        instance = this;
         setEGLContextClientVersion(3);
-
-        super.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
-
-        // Set the Renderer for drawing on the GLSurfaceView
-        
+        setEGLConfigChooser(8, 8, 8, 8, 16, 0);
         setRenderer(this);
-
-        // Render the view only when there is a change in the drawing data
         setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+
+        // Enable keyboard input
+        setFocusable(true);
+        setFocusableInTouchMode(true);
+
+        clipboardManager = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+
+        createHiddenEditText(context);
     }
-// JNI 方法声明
+
+    private void createHiddenEditText(Context context) {
+        container = new FrameLayout(context);
+
+        hiddenInput = new EditText(context);
+        hiddenInput.setLayoutParams(new FrameLayout.LayoutParams(1, 1));
+        hiddenInput.setAlpha(0f);
+        hiddenInput.setFocusable(true);
+        hiddenInput.setFocusableInTouchMode(true);
+
+        hiddenInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                String newText = s.toString();
+                if (newText.length() > lastText.length()) {
+                    String added = newText.substring(lastText.length());
+                    for (int i = 0; i < added.length(); i++) {
+                        char c = added.charAt(i);
+                        CharEvent((int) c);
+                    }
+                }
+                lastText = newText;
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {}
+        });
+
+        hiddenInput.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override
+            public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                if (actionId == EditorInfo.IME_ACTION_DONE
+                        || (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                    KeyEvent(KeyEvent.KEYCODE_ENTER, true);
+                    KeyEvent(KeyEvent.KEYCODE_ENTER, false);
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        hiddenInput.setOnKeyListener(new OnKeyListener() {
+            @Override
+            public boolean onKey(View v, int keyCode, KeyEvent event) {
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    int mappedKey = mapAndroidKeycode(keyCode);
+                    KeyEvent(mappedKey, true);
+                    if (keyCode == KeyEvent.KEYCODE_DEL && lastText.isEmpty()) {
+                        return true;
+                    }
+                } else if (event.getAction() == KeyEvent.ACTION_UP) {
+                    int mappedKey = mapAndroidKeycode(keyCode);
+                    KeyEvent(mappedKey, false);
+                }
+                return false;
+            }
+        });
+
+        container.addView(hiddenInput);
+    }
+
+    // Android KeyCode -> custom key id (must match AndroidKeyToImGuiKey in native)
+    private static int mapAndroidKeycode(int androidKeycode) {
+        switch (androidKeycode) {
+            case KeyEvent.KEYCODE_TAB:         return 0;
+            case KeyEvent.KEYCODE_DPAD_LEFT:   return 1;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:  return 2;
+            case KeyEvent.KEYCODE_DPAD_DOWN:   return 3;
+            case KeyEvent.KEYCODE_DPAD_UP:     return 4;
+            case KeyEvent.KEYCODE_SHIFT_LEFT:  return 5;
+            case KeyEvent.KEYCODE_SHIFT_RIGHT: return 6;
+            case KeyEvent.KEYCODE_CTRL_LEFT:   return 7;
+            case KeyEvent.KEYCODE_CTRL_RIGHT:  return 8;
+            case KeyEvent.KEYCODE_ALT_LEFT:    return 9;
+            case KeyEvent.KEYCODE_ALT_RIGHT:   return 10;
+            case KeyEvent.KEYCODE_CAPS_LOCK:   return 11;
+            case KeyEvent.KEYCODE_SCROLL_LOCK: return 12;
+            case KeyEvent.KEYCODE_NUM_LOCK:    return 13;
+            case KeyEvent.KEYCODE_SYSRQ:       return 14;
+            case KeyEvent.KEYCODE_BREAK:       return 15;
+            case KeyEvent.KEYCODE_INSERT:      return 16;
+            case KeyEvent.KEYCODE_FORWARD_DEL: return 23;
+            case KeyEvent.KEYCODE_A: return 29;
+            case KeyEvent.KEYCODE_B: return 30;
+            case KeyEvent.KEYCODE_C: return 31;
+            case KeyEvent.KEYCODE_D: return 32;
+            case KeyEvent.KEYCODE_E: return 33;
+            case KeyEvent.KEYCODE_F: return 34;
+            case KeyEvent.KEYCODE_G: return 35;
+            case KeyEvent.KEYCODE_H: return 36;
+            case KeyEvent.KEYCODE_I: return 37;
+            case KeyEvent.KEYCODE_J: return 38;
+            case KeyEvent.KEYCODE_K: return 39;
+            case KeyEvent.KEYCODE_L: return 40;
+            case KeyEvent.KEYCODE_M: return 41;
+            case KeyEvent.KEYCODE_N: return 42;
+            case KeyEvent.KEYCODE_O: return 43;
+            case KeyEvent.KEYCODE_P: return 44;
+            case KeyEvent.KEYCODE_Q: return 45;
+            case KeyEvent.KEYCODE_R: return 46;
+            case KeyEvent.KEYCODE_S: return 47;
+            case KeyEvent.KEYCODE_T: return 48;
+            case KeyEvent.KEYCODE_U: return 49;
+            case KeyEvent.KEYCODE_V: return 50;
+            case KeyEvent.KEYCODE_W: return 51;
+            case KeyEvent.KEYCODE_X: return 52;
+            case KeyEvent.KEYCODE_Y: return 53;
+            case KeyEvent.KEYCODE_Z: return 54;
+            case KeyEvent.KEYCODE_COMMA:  return 55;
+            case KeyEvent.KEYCODE_PERIOD: return 56;
+            case KeyEvent.KEYCODE_SPACE:  return 59;
+            case KeyEvent.KEYCODE_ENTER:  return 61;
+            case KeyEvent.KEYCODE_DEL:    return 67;
+            case KeyEvent.KEYCODE_ESCAPE: return 111;
+            default: return androidKeycode;
+        }
+    }
+
+    public FrameLayout getInputContainer() {
+        return container;
+    }
+
+    // ==================== JNI declarations ====================
     private native void DrawFrame();
     private native void ShutDown();
     private native void SurfaceCreated();
-    public static native String getWindowRect();
-    public static native void MotionEventClick(boolean isActionUp, float rawX, float rawY,int action);
     private native void SurfaceChanged(int width, int height);
+    public static native String getWindowRect();
+    public static native void MotionEventClick(boolean isActionUp, float rawX, float rawY, int action);
+    public static native void KeyEvent(int key, boolean down);
+    public static native void CharEvent(int c);
+    public static native void TextInput(String text);
+    public static native boolean WantTextInput();
+    public static native void SetClipboardText(String text);
+    public static native String GetClipboardText();
 
-    //private final float TOUCH_SCALE_FACTOR = 180.0f / 320;
-    private static final float TOUCH_SCALE_FACTOR = 0.015f;
-    private float mPreviousX;
-    private float mPreviousY;
+    @SuppressWarnings("unused")
+    public static void nativeSetClipboard(String text) {
+        if (instance != null && instance.clipboardManager != null) {
+            ClipData clip = ClipData.newPlainText("minida", text);
+            instance.clipboardManager.setPrimaryClip(clip);
+        }
+    }
 
+    private void syncClipboardToNative() {
+        if (clipboardManager != null && clipboardManager.hasPrimaryClip()) {
+            ClipData clip = clipboardManager.getPrimaryClip();
+            if (clip != null && clip.getItemCount() > 0) {
+                CharSequence text = clip.getItemAt(0).getText();
+                if (text != null) {
+                    SetClipboardText(text.toString());
+                }
+            }
+        }
+    }
+
+    // ==================== Touch handling ====================
     @Override
     public boolean onTouchEvent(MotionEvent e) {
-        // MotionEvent reports input details from the touch screen
-        // and other input controls. In this case, you are only
-        // interested in events where the touch position changed.
-
         float x = e.getX();
         float y = e.getY();
-int action = e.getAction();
+        int action = e.getAction();
         switch (action) {
-            case MotionEvent.ACTION_MOVE:
             case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_MOVE:
             case MotionEvent.ACTION_UP:
-                MotionEventClick(action != MotionEvent.ACTION_UP, e.getX(), e.getY(),action);
-
-                break;
-            default:
+                MotionEventClick(action != MotionEvent.ACTION_UP, x, y, action);
                 break;
         }
-        mPreviousX = x;
-        mPreviousY = y;
         return true;
     }
-    private int mWidth;
-    private int mHeight;
-    private static String TAG = "myRenderer";
-    private float mAngle =0;
-    private float mTransY=0;
-    private float mTransX=0;
-    private static final float Z_NEAR = 1f;
-    private static final float Z_FAR = 40f;
 
-    // mMVPMatrix is an abbreviation for "Model View Projection Matrix"
-    private final float[] mMVPMatrix = new float[16];
-    private final float[] mProjectionMatrix = new float[16];
-    private final float[] mViewMatrix = new float[16];
-    private final float[] mRotationMatrix = new float[16];
-    
-    
-    public static int LoadShader(int type, String shaderSrc) {
-        int shader;
-        int[] compiled = new int[1];
-
-        // Create the shader object
-        shader = GLES30.glCreateShader(type);
-
-        if (shader == 0) {
-            return 0;
-        }
-
-        // Load the shader source
-        GLES30.glShaderSource(shader, shaderSrc);
-
-        // Compile the shader
-        GLES30.glCompileShader(shader);
-
-        // Check the compile status
-        GLES30.glGetShaderiv(shader, GLES30.GL_COMPILE_STATUS, compiled, 0);
-
-        if (compiled[0] == 0) {
-            Log.e(TAG, "Erorr!!!!");
-            Log.e(TAG, GLES30.glGetShaderInfoLog(shader));
-            GLES30.glDeleteShader(shader);
-            return 0;
-        }
-
-        return shader;
+    // ==================== Keyboard handling ====================
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        int mappedKey = mapAndroidKeycode(keyCode);
+        KeyEvent(mappedKey, true);
+        return super.onKeyDown(keyCode, event);
     }
 
-    /**
-     * Utility method for debugging OpenGL calls. Provide the name of the call
-     * just after making it:
-     *
-     * <pre>
-     * mColorHandle = GLES30.glGetUniformLocation(mProgram, "vColor");
-     * MyGLRenderer.checkGlError("glGetUniformLocation");</pre>
-     *
-     * If the operation is not successful, the check throws an error.
-     *
-     * @param glOperation - Name of the OpenGL call to check.
-     */
-    public static void checkGlError(String glOperation) {
-        int error;
-        while ((error = GLES30.glGetError()) != GLES30.GL_NO_ERROR) {
-            Log.e(TAG, glOperation + ": glError " + error);
-            throw new RuntimeException(glOperation + ": glError " + error);
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        int mappedKey = mapAndroidKeycode(keyCode);
+        KeyEvent(mappedKey, false);
+        return super.onKeyUp(keyCode, event);
+    }
+
+    public void showSoftKeyboard() {
+        Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (hiddenInput != null) {
+                    hiddenInput.requestFocus();
+                    hiddenInput.setText("");
+                    lastText = "";
+                    InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                    if (imm != null) {
+                        imm.showSoftInput(hiddenInput, InputMethodManager.SHOW_FORCED);
+                    }
+                    keyboardVisible = true;
+                }
+            }
+        });
+    }
+
+    public void hideSoftKeyboard() {
+        Handler handler = new Handler(Looper.getMainLooper());
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
+                if (imm != null) {
+                    imm.hideSoftInputFromWindow(getWindowToken(), 0);
+                }
+                if (hiddenInput != null) {
+                    hiddenInput.clearFocus();
+                }
+                keyboardVisible = false;
+            }
+        });
+    }
+
+    public void pollTextInput() {
+        boolean want = WantTextInput();
+        if (want && !keyboardVisible) {
+            syncClipboardToNative();
+            showSoftKeyboard();
+        } else if (!want && keyboardVisible) {
+            hideSoftKeyboard();
         }
     }
 
-    ///
-    // Initialize the shader and program object
-    //
+    public static void requestKeyboard() {
+        if (instance != null) instance.showSoftKeyboard();
+    }
+
+    public static void hideKeyboard() {
+        if (instance != null) instance.hideSoftKeyboard();
+    }
+
+    // ==================== GLSurfaceView.Renderer ====================
+    @Override
     public void onSurfaceCreated(GL10 glUnused, EGLConfig config) {
-
-
-        //set the clear buffer color to light gray.
-        //GLES30.glClearColor(0.9f, .9f, 0.9f, 0.9f);
-        //set the clear buffer color to a dark grey.
-        GLES30.glClearColor(0.1f, .1f, 0.1f, 0.9f);
-        //initialize the cube code for drawing.
-        //if we had other objects setup them up here as well.
+        GLES30.glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
         try {
             SurfaceCreated();
-        } catch (UnsatisfiedLinkError unused) {
-            // 处理链接错误
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "SurfaceCreated JNI not linked", e);
         }
     }
 
-    // /
-    // Draw a triangle using the shader pair created in onSurfaceCreated()
-    //
+    @Override
     public void onDrawFrame(GL10 glUnused) {
-
-        // Clear the color buffer  set above by glClearColor.
         GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT | GLES30.GL_DEPTH_BUFFER_BIT);
-
-        //need this otherwise, it will over right stuff and the cube will look wrong!
-        GLES30.glEnable(GLES30.GL_DEPTH_TEST);
-
-        // Set the camera position (View matrix)  note Matrix is an include, not a declared method.
-        Matrix.setLookAtM(mViewMatrix, 0, 0, 0, -3, 0f, 0f, 0f, 0f, 1.0f, 0.0f);
-
-        // Create a rotation and translation for the cube
-        Matrix.setIdentityM(mRotationMatrix, 0);
-
-        //move the cube up/down and left/right
-        Matrix.translateM(mRotationMatrix, 0, mTransX, mTransY, 0);
-
-        //mangle is how fast, x,y,z which directions it rotates.
-        Matrix.rotateM(mRotationMatrix, 0, mAngle, 1.0f, 1.0f, 1.0f);
-
-        // combine the model with the view matrix
-        Matrix.multiplyMM(mMVPMatrix, 0, mViewMatrix, 0, mRotationMatrix, 0);
-
-        // combine the model-view with the projection matrix
-        Matrix.multiplyMM(mMVPMatrix, 0, mProjectionMatrix, 0, mMVPMatrix, 0);
-
-        //change the angle, so the cube will spin.
-        mAngle+=.4;
-
         try {
             DrawFrame();
-        } catch (UnsatisfiedLinkError unused) {
-            // 处理链接错误
+            pollTextInput();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "DrawFrame JNI not linked", e);
         }
     }
 
-    // /
-    // Handle surface changes
-    //
+    @Override
     public void onSurfaceChanged(GL10 glUnused, int width, int height) {
-        mWidth = width;
-        mHeight = height;
-        // Set the viewport
-        GLES30.glViewport(0, 0, mWidth, mHeight);
-        float aspect = (float) width / height;
-
-        // this projection matrix is applied to object coordinates
-        //no idea why 53.13f, it was used in another example and it worked.
-        Matrix.perspectiveM(mProjectionMatrix, 0, 53.13f, aspect, Z_NEAR, Z_FAR);
+        GLES30.glViewport(0, 0, width, height);
         try {
-
             SurfaceChanged(width, height);
-        } catch (UnsatisfiedLinkError unused) {
-            // 处理链接错误
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "SurfaceChanged JNI not linked", e);
         }
     }
-
-    //used the touch listener to move the cube up/down (y) and left/right (x)
-    public float getY() {
-        return mTransY;
-    }
-
-    public void setY(float mY) {
-        mTransY = mY;
-    }
-
-    public float getX() {
-        return mTransX;
-    }
-
-    public void setX(float mX) {
-        mTransX = mX;
-    }
-    
-  
-   
-   
 
     @Override
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
-        ShutDown();
-        // 从窗口中移除视图
-
-
+        try {
+            ShutDown();
+        } catch (UnsatisfiedLinkError e) {
+            Log.e(TAG, "ShutDown JNI not linked", e);
+        }
     }
 }
