@@ -18,11 +18,12 @@ android {
 
     signingConfigs {
         release {
-            if (project.hasProperty('android.injected.signing.store.file')) {
-                storeFile file(android.injected.signing.store.file)
-                storePassword android.injected.signing.store.password
-                keyAlias android.injected.signing.key.alias
-                keyPassword android.injected.signing.key.password
+            def storeFilePath = project.findProperty('android.injected.signing.store.file')
+            if (storeFilePath) {
+                storeFile file(storeFilePath)
+                storePassword project.findProperty('android.injected.signing.store.password')
+                keyAlias project.findProperty('android.injected.signing.key.alias')
+                keyPassword project.findProperty('android.injected.signing.key.password')
             }
         }
     }
